@@ -91,6 +91,7 @@ is not mistaken for the end of the timeline.
 | `Model.js` | Pure helpers: paging, HTML/URL sanitising, media extraction |
 | `oauth_server.py` | Local HTTP callback server used during login |
 | `manifest.json` | Omarchy plugin manifest (id, entry points, bar placement) |
+| `LICENSE` | MIT license text |
 | `~/.local/state/omarchy-mastodon/auth.json` | OAuth token (**yours, never in the repo**) |
 
 Only `manifest.json`, `BarWidget.qml`, `Panel.qml`, `Model.js` and
@@ -260,3 +261,22 @@ passes arrays to functions as `QVariantList`, for which `Array.isArray()` is
 **Local or Mentions tab is empty.** Not necessarily a bug. Some instances expose
 little or no public local timeline, and a muted/blocked filter can leave Mentions
 empty while Home is full.
+
+## License
+
+[MIT](LICENSE) — Copyright (c) 2026 Sascha Manns.
+
+You are free to use, copy, modify, merge, publish, distribute, sublicense and
+sell copies, and the license text must be kept in all copies or substantial
+portions of the software. The software is provided without any warranty.
+
+## Contributing
+
+Patches are welcome. Two things are worth knowing before you start:
+
+- **Do not commit anything that changes at runtime into the plugin directory.**
+  Quickshell watches `~/.config/omarchy/plugins/` and reloads the plugin on any
+  change, which closes an open panel and can leave the OAuth `Process` dead.
+  Scratch files and test data belong in `/tmp`.
+- **Test QML in the running shell, not with `qmllint`.** The `qs.*` imports make
+  `qmllint` report false positives; `journalctl --user` is the source of truth.

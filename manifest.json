@@ -4,6 +4,7 @@
   "name": "Mastodon client",
   "version": "1.0.0",
   "author": "Sascha Manns",
+  "license": "MIT",
   "description": "Mastodon client with OAuth login, Home/Local/Mentions timelines, posting and interactions",
   "kinds": ["bar-widget"],
   "entryPoints": {
