@@ -1,0 +1,19 @@
+{
+  "schemaVersion": 1,
+  "id": "saigkill.mastodon",
+  "name": "Mastodon client",
+  "version": "1.0.0",
+  "author": "Sascha Manns",
+  "description": "Mastodon client with OAuth login, Home/Local/Mentions timelines, posting and interactions",
+  "kinds": ["bar-widget"],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Mastodon client",
+    "description": "Mastodon icon in the bar. Opens a panel with OAuth login, timelines (Home, Local, Mentions), a composer and post interactions.",
+    "category": "Internet",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}
