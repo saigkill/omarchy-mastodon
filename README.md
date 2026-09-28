@@ -63,6 +63,45 @@ To change the total height, edit `Style.space(700)` in `Panel.qml` (the
    outside the plugin directory — writing there makes Quickshell reload the
    plugin and drop an open panel)
 
+## Credential handling
+
+All Mastodon API calls and all reads/writes of the state file go through
+`mastodon_helper.py`, not `curl` and not a shell. This is deliberate, not
+incidental:
+
+- **Nothing secret ever appears on a command line.** `/proc/<pid>/cmdline` is
+  world-readable, so any local process could once read the access token, the
+  OAuth client secret and the authorization code straight out of `ps` output.
+  The QML side now only ever passes the helper non-secret arguments (an
+  endpoint, a status, a redirect URI); the helper reads the token and the
+  client secret from its own state file, and the one-time authorization code
+  arrives through the `MASTODON_OAUTH_CODE` environment variable instead
+  (`/proc/<pid>/environ` is readable only by the owning user).
+- **The panel holds no secret at all.** `BarWidget.qml`'s view of the
+  credentials (`Model.emptyAuth()`) is just `{ instance, clientId, hasToken }`.
+  The access token and the client secret are owned exclusively by the helper
+  and never travel back into QML, so a crash, a log line or a stray property
+  in the panel cannot leak either of them.
+- **`auth.json` is `0600` and symlink-safe.** The helper opens it with
+  `O_NOFOLLOW`, so a symlink planted at that path is refused instead of
+  followed, and permissions are re-tightened on every write even if the file
+  pre-dates this version.
+- **Non-loopback instances must be `https`.** `Model.normalizeInstance()` (QML
+  side) and `secure_base()` (helper side) both reject `http://` except to
+  `localhost`/`127.0.0.0/8`/`::1`, which is only ever used for the local OAuth
+  callback. Lookalike hosts (`127.0.0.1.evil.example`) and userinfo smuggling
+  (`host@evil.example`) are rejected explicitly, not just by accident of
+  string matching.
+- **Redirects can't exfiltrate the token.** A same-method redirect keeps the
+  `Authorization` header, so the helper's opener refuses to follow one that
+  changes scheme or host.
+- **Response bodies are capped at 10 MiB** so a malicious or compromised
+  instance cannot exhaust the helper (and, downstream, the QML
+  `StdioCollector` that buffers its stdout) with an oversized reply.
+
+See `mastodon_helper.py`'s module docstring for the full reasoning, and
+`tests/test_helper.py` for the tests that pin this behaviour down.
+
 ## API endpoints used
 
 - `POST /api/v1/apps` — register OAuth app
@@ -87,17 +126,19 @@ is not mistaken for the end of the timeline.
 | Path | What it is |
 | --- | --- |
 | `Panel.qml` | Panel UI: header, tabs, composer, feed, cards, media |
-| `BarWidget.qml` | Bar slot, icon button, OAuth orchestration, token storage |
-| `Model.js` | Pure helpers: paging, HTML/URL sanitising, media extraction |
+| `BarWidget.qml` | Bar slot, icon button, OAuth orchestration |
+| `Model.js` | Pure helpers: command builders, paging, HTML/URL sanitising, media extraction. Holds no credential. |
+| `mastodon_helper.py` | Owns every credential: talks to the Mastodon API and reads/writes the state file. See "Credential handling" above |
 | `oauth_server.py` | Local HTTP callback server used during login |
 | `manifest.json` | Omarchy plugin manifest (id, entry points, bar placement) |
 | `LICENSE` | MIT license text |
-| `~/.local/state/omarchy-mastodon/auth.json` | OAuth token (**yours, never in the repo**) |
+| `~/.local/state/omarchy-mastodon/auth.json` | OAuth token, `0600`, owned by `mastodon_helper.py` (**yours, never in the repo**) |
 
-Only `manifest.json`, `BarWidget.qml`, `Panel.qml`, `Model.js` and
-`oauth_server.py` belong in the plugin directory. Do not put anything else there
-that changes at runtime — Quickshell watches the directory and reloads the
-plugin, which closes an open panel and can leave a `Quickshell.Io.Process` dead.
+Only `manifest.json`, `BarWidget.qml`, `Panel.qml`, `Model.js`,
+`mastodon_helper.py` and `oauth_server.py` belong in the plugin directory. Do
+not put anything else there that changes at runtime — Quickshell watches the
+directory and reloads the plugin, which closes an open panel and can leave a
+`Quickshell.Io.Process` dead.
 
 ## Install
 
@@ -148,8 +189,8 @@ Useful when you work on the plugin locally and want to edit the files directly.
 
 ```sh
 # 1. get the code somewhere
-git clone https://github.com/saigkill/omarchy-mastodon1.git ~/src/omarchy-mastodon1
-cd ~/src/omarchy-mastodon1
+git clone https://github.com/saigkill/omarchy-mastodon.git ~/src/omarchy-mastodon
+cd ~/src/omarchy-mastodon
 
 # 2. check the plugin folder is valid before copying it in
 omarchy plugin validate .
@@ -158,8 +199,9 @@ omarchy plugin validate .
 mkdir -p ~/.config/omarchy/plugins
 cp -r . ~/.config/omarchy/plugins/saigkill.mastodon
 
-# 4. make the login helper executable (needed for the OAuth callback)
+# 4. make both Python helpers executable (needed for login and every API call)
 chmod +x ~/.config/omarchy/plugins/saigkill.mastodon/oauth_server.py
+chmod +x ~/.config/omarchy/plugins/saigkill.mastodon/mastodon_helper.py
 
 # 5. enable it
 omarchy plugin enable saigkill.mastodon
@@ -262,6 +304,24 @@ passes arrays to functions as `QVariantList`, for which `Array.isArray()` is
 little or no public local timeline, and a muted/blocked filter can leave Mentions
 empty while Home is full.
 
+## Testing
+
+Two independent test suites cover the parts that matter most: that no
+credential ever reaches a process argument or the panel, and that a token is
+only ever sent over TLS to the instance it was issued for.
+
+```sh
+# Model.js: command builders, instance validation, the credential-shaped view
+node tests/test_model.js
+
+# mastodon_helper.py: TLS enforcement, redirect handling, state file
+# permissions/symlink safety, response size cap
+python3 -m unittest discover -s tests -v
+```
+
+Both should be run before sending a patch that touches `Model.js`,
+`BarWidget.qml`, `Panel.qml` or `mastodon_helper.py`.
+
 ## License
 
 [MIT](LICENSE) — Copyright (c) 2026 Sascha Manns.
@@ -280,3 +340,7 @@ Patches are welcome. Two things are worth knowing before you start:
   Scratch files and test data belong in `/tmp`.
 - **Test QML in the running shell, not with `qmllint`.** The `qs.*` imports make
   `qmllint` report false positives; `journalctl --user` is the source of truth.
+- **Never reintroduce a credential into `Model.js`, `BarWidget.qml` or
+  `Panel.qml`.** The access token and the client secret must stay inside
+  `mastodon_helper.py`; see "Credential handling" above and run both test
+  suites (see "Testing") before submitting.
