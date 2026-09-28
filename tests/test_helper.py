@@ -103,6 +103,17 @@ class Recorder:
                 self._reply()
 
             def _reply(self):
+                if self.path == "/huge":
+                    # One byte over the helper's cap, framed as a syntactically
+                    # valid (if truncated-looking) JSON array so a bug that
+                    # forgot to enforce the limit would still parse it.
+                    payload = b"[" + b"1," * (10 * 1024 * 1024) + b"1]"
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(payload)))
+                    self.end_headers()
+                    self.wfile.write(payload)
+                    return
                 payload = json.dumps({"ok": True, "path": self.path}).encode("utf-8")
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
@@ -284,6 +295,26 @@ class TokenStaysOnTls(HelperTestCase):
         self.assertEqual(self.server.last["headers"]["Host"], "localhost:%d" % self.server.port)
 
 
+class StateFileSymlinkAttack(HelperTestCase):
+    def test_a_symlinked_state_file_is_refused_instead_of_followed(self):
+        # If another user (or a compromised process running as this one)
+        # replaces auth.json with a symlink, the write must not follow it:
+        # otherwise the access token/client secret would land in whatever
+        # file the symlink points at instead of the intended state file.
+        target = os.path.join(self.state_dir, "victim.json")
+        with open(target, "w", encoding="utf-8") as handle:
+            handle.write("not touched")
+        os.makedirs(os.path.dirname(self.state), exist_ok=True)
+        os.symlink(target, self.state)
+
+        result = self.run_helper("logout")
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertTrue(os.path.islink(self.state), "the symlink itself was removed")
+        with open(target, encoding="utf-8") as handle:
+            self.assertEqual(handle.read(), "not touched")
+
+
 class StateFilePermissions(HelperTestCase):
     def test_state_file_is_owner_only(self):
         self.run_helper("logout")
@@ -403,6 +434,16 @@ class RedirectsAndErrors(HelperTestCase):
         self.write_auth(instance=self.server.base, accessToken=TOKEN)
         result = self.run_helper("post", "/api/v1/statuses", "status")
         self.assertEqual(result.returncode, helper.EXIT_USAGE)
+
+    def test_an_oversized_response_is_refused_instead_of_buffered(self):
+        # A malicious or compromised instance must not be able to exhaust the
+        # helper's (and the QML StdioCollector's) memory with an enormous
+        # response body.
+        self.write_auth(instance=self.server.base, accessToken=TOKEN)
+        result = self.run_helper("get", "/huge")
+        self.assertEqual(result.returncode, helper.EXIT_HTTP)
+        self.assertIn(b"response_too_large", result.stderr)
+        self.assertEqual(result.stdout, b"")
 
 
 class ConstantsMatchThePanel(HelperTestCase):

@@ -1,6 +1,8 @@
-var APP_NAME = "Omarchy Mastodon"
+// The app name and website are only ever sent to a Mastodon instance during
+// app registration, which now happens entirely inside mastodon_helper.py, so
+// they are declared there and nowhere else. APP_SCOPES stays here too: the
+// panel needs it to build the browser authorize URL.
 var APP_SCOPES = "read write follow"
-var APP_WEBSITE = "https://github.com/saigkill/omarchy-mastodon1"
 var PAGE_SIZE = 40
 var MAX_MEDIA_PER_STATUS = 4
 
@@ -419,9 +421,7 @@ function decode(data) {
 
 if (typeof module !== "undefined") {
   module.exports = {
-    APP_NAME: APP_NAME,
     APP_SCOPES: APP_SCOPES,
-    APP_WEBSITE: APP_WEBSITE,
     normalizeInstance: normalizeInstance,
     displayInstance: displayInstance,
     randomPort: randomPort,

@@ -30,9 +30,15 @@ import urllib.request
 # Keep in sync with Model.js; tests/test_model.js asserts that they match.
 APP_NAME = "Omarchy Mastodon"
 APP_SCOPES = "read write follow"
-APP_WEBSITE = "https://github.com/saigkill/omarchy-mastodon1"
+APP_WEBSITE = "https://github.com/saigkill/omarchy-mastodon"
 
 TIMEOUT = 30
+
+# A timeline page or a single status is a few kilobytes; 10 MiB is generous
+# headroom for that while still being far too small for a malicious or
+# compromised instance to use an oversized response to exhaust the helper's
+# memory (and, downstream, the QML StdioCollector that buffers its stdout).
+MAX_RESPONSE_BYTES = 10 * 1024 * 1024
 
 # The only keys the panel is allowed to write. clientSecret and accessToken are
 # owned by this script so that a compromised or buggy panel cannot overwrite a
@@ -91,10 +97,23 @@ def write_state(state):
     if directory:
         os.makedirs(directory, mode=0o700, exist_ok=True)
     payload = json.dumps({"auth": state["auth"]})
-    # os.open only applies mode when it creates the file, and the process umask
-    # can only ever remove bits, so the permissions are set again afterwards.
-    # A pre-existing file from an older install also gets tightened here.
-    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    # O_NOFOLLOW makes the open fail instead of following a symlink planted
+    # at this path: without it, another user (or a compromised process
+    # running as this one) could replace auth.json with a symlink to an
+    # unrelated file and have the access token/client secret written there
+    # the next time the panel logs in or saves. O_EXCL cannot be used here
+    # since a real, previously written state file is the common case; the
+    # no-follow check is what stops the redirection, not exclusivity.
+    #
+    # os.open only applies mode when it creates the file, and the process
+    # umask can only ever remove bits, so the permissions are set again
+    # afterwards. A pre-existing file from an older install also gets
+    # tightened here.
+    try:
+        descriptor = os.open(
+            path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+    except OSError as error:
+        raise HelperError("state_file_unsafe", EXIT_STATE) from error
     with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
         os.fchmod(handle.fileno(), 0o600)
         handle.write(payload)
@@ -178,6 +197,18 @@ def loopback_uri(uri):
     raise HelperError("bad_redirect_uri", EXIT_USAGE)
 
 
+def read_capped(response, limit=MAX_RESPONSE_BYTES):
+    """Read a response body, refusing anything larger than `limit`.
+
+    Reading `limit + 1` bytes is enough to tell "exactly at the limit" from
+    "over the limit" without ever buffering more than one byte past it.
+    """
+    payload = response.read(limit + 1)
+    if len(payload) > limit:
+        raise HelperError("response_too_large", EXIT_HTTP)
+    return payload
+
+
 class SameOriginRedirect(urllib.request.HTTPRedirectHandler):
     """Never let a redirect carry the Authorization header to another origin."""
 
@@ -214,7 +245,7 @@ def api_request(method, endpoint, auth, fields=None):
     opener = urllib.request.build_opener(SameOriginRedirect)
     try:
         with opener.open(request, timeout=TIMEOUT) as response:
-            payload = response.read()
+            payload = read_capped(response)
     except urllib.error.HTTPError as error:
         # curl ran with -f, which also suppressed the body and returned a
         # non-zero status, so the panel already treats a failed page as
@@ -242,7 +273,7 @@ def anonymous_post(endpoint, fields, auth):
     opener = urllib.request.build_opener(SameOriginRedirect)
     try:
         with opener.open(request, timeout=TIMEOUT) as response:
-            payload = response.read()
+            payload = read_capped(response)
     except urllib.error.HTTPError as error:
         raise HelperError("http_%d" % error.code, EXIT_HTTP) from None
     except (urllib.error.URLError, OSError):
