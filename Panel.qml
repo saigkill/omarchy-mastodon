@@ -335,9 +335,268 @@ Panel {
       onCloseRequested: root.close()
       onTabRequested: function(direction) { root.switchPanel(direction) }
 
+
+      Item {
+        id: fixedTop
+        anchors.top: parent.top
+        anchors.left: parent.left
+        anchors.right: parent.right
+        // The children are chained with anchors and summed explicitly. The
+        // Column's implicitHeight collapsed to 0 here, which left the feed
+        // filling the whole panel on top of the composer.
+        height: headerItem.height + loginRect.height + tabsRect.height
+          + composerRect.height + Style.space(8) * 3
+
+        Item {
+          id: headerItem
+          anchors.top: parent.top
+          anchors.left: parent.left
+          anchors.right: parent.right
+          height: headerRow.height
+
+          Row {
+            id: headerRow
+            spacing: Style.space(8)
+
+            PanelSectionHeader {
+              anchors.verticalCenter: parent.verticalCenter
+              foreground: root.contentForeground
+              fontFamily: root.contentFontFamily
+              text: "MASTODON"
+            }
+
+            PanelActionButton {
+              iconText: "\uf021"
+              tooltipText: "Reload"
+              foreground: root.contentForeground
+              fontFamily: root.contentFontFamily
+              onClicked: root.loadTimelines()
+            }
+
+            PanelActionButton {
+              iconText: "\uf09b"
+              tooltipText: "Logout"
+              foreground: root.contentForeground
+              fontFamily: root.contentFontFamily
+              onClicked: root.logout()
+            }
+          }
+        }
+
+        Rectangle {
+          id: loginRect
+          visible: !root.authed
+          anchors.top: headerItem.bottom
+          anchors.topMargin: Style.space(8)
+          anchors.left: parent.left
+          anchors.right: parent.right
+          height: visible ? loginColumn.implicitHeight + Style.space(16) : 0
+          radius: Style.cornerRadius
+          color: Style.controlFill(false, false, root.contentForeground, Color.accent)
+
+          Column {
+            id: loginColumn
+            anchors.left: parent.left
+            anchors.right: parent.right
+            anchors.leftMargin: Style.space(12)
+            anchors.rightMargin: Style.space(12)
+            anchors.verticalCenter: parent.verticalCenter
+            spacing: Style.space(8)
+
+            Text {
+              width: parent.width
+              text: "Login with Mastodon"
+              color: root.contentForeground
+              font.family: root.contentFontFamily
+              font.pixelSize: Style.font.body
+              font.bold: true
+            }
+
+            TextField {
+              id: instanceField
+              width: parent.width
+              foreground: root.contentForeground
+              text: root.loginInstance
+              placeholderText: "Instance (e.g. mastodon.social)"
+              onTextEdited: root.loginInstance = text
+              Keys.onEscapePressed: function(event) {
+                keyCatcher.forceActiveFocus()
+                event.accepted = true
+              }
+            }
+
+            Text {
+              width: parent.width
+              visible: root.loginError !== ""
+              text: root.loginError
+              color: Color.urgent
+              font.family: root.contentFontFamily
+              font.pixelSize: Style.font.caption
+              wrapMode: Text.WordWrap
+            }
+
+            Button {
+              text: root.loggingIn ? "Logging in..." : "Login"
+              bordered: true
+              focusable: true
+              enabled: !root.loggingIn && root.loginInstance.trim() !== ""
+              foreground: root.contentForeground
+              fontFamily: root.contentFontFamily
+              onClicked: {
+                if (root.hostWidget) root.hostWidget.startOAuth()
+              }
+            }
+          }
+        }
+
+        Rectangle {
+          id: tabsRect
+          visible: root.authed
+          anchors.top: loginRect.bottom
+          anchors.topMargin: Style.space(8)
+          anchors.left: parent.left
+          anchors.right: parent.right
+          height: visible ? tabRow.implicitHeight + Style.space(12) : 0
+          radius: Style.cornerRadius
+          color: Style.controlFill(false, false, root.contentForeground, Color.accent)
+
+          Row {
+            id: tabRow
+            anchors.left: parent.left
+            anchors.right: parent.right
+            anchors.leftMargin: Style.space(8)
+            anchors.rightMargin: Style.space(8)
+            anchors.verticalCenter: parent.verticalCenter
+            spacing: Style.space(4)
+
+            Repeater {
+              model: ["Home", "Local", "Mentions"]
+
+              Button {
+                required property string modelData
+                required property int index
+                text: modelData
+                bordered: root.currentTab === index
+                focusable: true
+                foreground: root.contentForeground
+                fontFamily: root.contentFontFamily
+                onClicked: root.currentTab = index
+              }
+            }
+          }
+        }
+
+        Rectangle {
+          id: composerRect
+          visible: root.authed
+          anchors.top: tabsRect.bottom
+          anchors.topMargin: Style.space(8)
+          anchors.left: parent.left
+          anchors.right: parent.right
+          height: visible ? composerColumn.implicitHeight + Style.space(12) : 0
+          radius: Style.cornerRadius
+          color: Style.controlFill(false, false, root.contentForeground, Color.accent)
+
+          Column {
+            id: composerColumn
+            anchors.left: parent.left
+            anchors.right: parent.right
+            anchors.leftMargin: Style.space(12)
+            anchors.rightMargin: Style.space(12)
+            anchors.verticalCenter: parent.verticalCenter
+            spacing: Style.space(6)
+
+            Text {
+              width: parent.width
+              visible: root.replyToUser !== ""
+              text: "Replying to " + root.replyToUser
+              color: Qt.darker(root.contentForeground, 1.5)
+              font.family: root.contentFontFamily
+              font.pixelSize: Style.font.caption
+              elide: Text.ElideRight
+            }
+
+            Rectangle {
+              width: parent.width
+              height: Style.space(70)
+              radius: Style.cornerRadius
+              color: Style.controlFill(false, false, root.contentForeground, Color.accent)
+
+              Text {
+                anchors.left: parent.left
+                anchors.leftMargin: Style.space(10)
+                anchors.right: parent.right
+                anchors.rightMargin: Style.space(10)
+                anchors.top: parent.top
+                anchors.topMargin: Style.space(8)
+                visible: root.composerText === ""
+                text: root.replyToUser !== "" ? "Write a reply..." : "What's on your mind?"
+                color: Qt.darker(root.contentForeground, 1.6)
+                font.family: root.contentFontFamily
+                font.pixelSize: Style.font.body
+                wrapMode: Text.WordWrap
+              }
+
+              TextEdit {
+                id: composerInput
+                anchors.fill: parent
+                anchors.margins: Style.space(8)
+                text: root.composerText
+                color: root.contentForeground
+                font.family: root.contentFontFamily
+                font.pixelSize: Style.font.body
+                wrapMode: TextEdit.Wrap
+                selectByMouse: true
+                onTextEdited: root.composerText = text
+                Keys.onEscapePressed: function(event) {
+                  if (root.replyToId !== "") root.cancelReply()
+                  keyCatcher.forceActiveFocus()
+                  event.accepted = true
+                }
+              }
+            }
+
+            Row {
+              spacing: Style.space(8)
+
+              Button {
+                text: root.posting ? "Posting..." : "Post"
+                bordered: true
+                focusable: true
+                enabled: !root.posting && root.composerText.trim() !== ""
+                foreground: root.contentForeground
+                fontFamily: root.contentFontFamily
+                onClicked: root.postStatus()
+              }
+
+              Button {
+                visible: root.replyToId !== ""
+                text: "Cancel"
+                foreground: root.contentForeground
+                fontFamily: root.contentFontFamily
+                onClicked: root.cancelReply()
+              }
+
+              Text {
+                anchors.verticalCenter: parent.verticalCenter
+                visible: root.postError !== ""
+                text: root.postError
+                color: Color.urgent
+                font.family: root.contentFontFamily
+                font.pixelSize: Style.font.caption
+              }
+            }
+          }
+        }
+      }
+
       Flickable {
         id: scroll
-        anchors.fill: parent
+        anchors.top: fixedTop.bottom
+        anchors.topMargin: Style.space(8)
+        anchors.left: parent.left
+        anchors.right: parent.right
+        anchors.bottom: parent.bottom
         clip: true
         contentWidth: width
         contentHeight: contentColumn.implicitHeight
@@ -349,237 +608,6 @@ Panel {
           id: contentColumn
           width: scroll.width
           spacing: Style.space(8)
-
-          Item {
-            width: parent.width
-            height: headerRow.height
-            implicitHeight: headerRow.height
-
-            Row {
-              id: headerRow
-              spacing: Style.space(8)
-
-              PanelSectionHeader {
-                anchors.verticalCenter: parent.verticalCenter
-                foreground: root.contentForeground
-                fontFamily: root.contentFontFamily
-                text: "MASTODON"
-              }
-
-              PanelActionButton {
-                iconText: "\uf021"
-                tooltipText: "Reload"
-                foreground: root.contentForeground
-                fontFamily: root.contentFontFamily
-                onClicked: root.loadTimelines()
-              }
-
-              PanelActionButton {
-                iconText: "\uf09b"
-                tooltipText: "Logout"
-                foreground: root.contentForeground
-                fontFamily: root.contentFontFamily
-                onClicked: root.logout()
-              }
-            }
-          }
-
-          Rectangle {
-            visible: !root.authed
-            width: parent.width
-            height: visible ? loginColumn.implicitHeight + Style.space(16) : 0
-            implicitHeight: visible ? loginColumn.implicitHeight + Style.space(16) : 0
-            radius: Style.cornerRadius
-            color: Style.controlFill(false, false, root.contentForeground, Color.accent)
-
-            Column {
-              id: loginColumn
-              anchors.left: parent.left
-              anchors.right: parent.right
-              anchors.leftMargin: Style.space(12)
-              anchors.rightMargin: Style.space(12)
-              anchors.verticalCenter: parent.verticalCenter
-              spacing: Style.space(8)
-
-              Text {
-                width: parent.width
-                text: "Login with Mastodon"
-                color: root.contentForeground
-                font.family: root.contentFontFamily
-                font.pixelSize: Style.font.body
-                font.bold: true
-              }
-
-              TextField {
-                id: instanceField
-                width: parent.width
-                foreground: root.contentForeground
-                text: root.loginInstance
-                placeholderText: "Instance (e.g. mastodon.social)"
-                onTextEdited: root.loginInstance = text
-                Keys.onEscapePressed: function(event) {
-                  keyCatcher.forceActiveFocus()
-                  event.accepted = true
-                }
-              }
-
-              Text {
-                width: parent.width
-                visible: root.loginError !== ""
-                text: root.loginError
-                color: Color.urgent
-                font.family: root.contentFontFamily
-                font.pixelSize: Style.font.caption
-                wrapMode: Text.WordWrap
-              }
-
-              Button {
-                text: root.loggingIn ? "Logging in..." : "Login"
-                bordered: true
-                focusable: true
-                enabled: !root.loggingIn && root.loginInstance.trim() !== ""
-                foreground: root.contentForeground
-                fontFamily: root.contentFontFamily
-                onClicked: {
-                  if (root.hostWidget) root.hostWidget.startOAuth()
-                }
-              }
-            }
-          }
-
-          Rectangle {
-            visible: root.authed
-            width: parent.width
-            height: visible ? tabRow.implicitHeight + Style.space(12) : 0
-            implicitHeight: visible ? tabRow.implicitHeight + Style.space(12) : 0
-            radius: Style.cornerRadius
-            color: Style.controlFill(false, false, root.contentForeground, Color.accent)
-
-            Row {
-              id: tabRow
-              anchors.left: parent.left
-              anchors.right: parent.right
-              anchors.leftMargin: Style.space(8)
-              anchors.rightMargin: Style.space(8)
-              anchors.verticalCenter: parent.verticalCenter
-              spacing: Style.space(4)
-
-              Repeater {
-                model: ["Home", "Local", "Mentions"]
-
-                Button {
-                  required property string modelData
-                  required property int index
-                  text: modelData
-                  bordered: root.currentTab === index
-                  focusable: true
-                  foreground: root.contentForeground
-                  fontFamily: root.contentFontFamily
-                  onClicked: root.currentTab = index
-                }
-              }
-            }
-          }
-
-          Rectangle {
-            visible: root.authed
-            width: parent.width
-            height: visible ? composerColumn.implicitHeight + Style.space(12) : 0
-            implicitHeight: visible ? composerColumn.implicitHeight + Style.space(12) : 0
-            radius: Style.cornerRadius
-            color: Style.controlFill(false, false, root.contentForeground, Color.accent)
-
-            Column {
-              id: composerColumn
-              anchors.left: parent.left
-              anchors.right: parent.right
-              anchors.leftMargin: Style.space(12)
-              anchors.rightMargin: Style.space(12)
-              anchors.verticalCenter: parent.verticalCenter
-              spacing: Style.space(6)
-
-              Text {
-                width: parent.width
-                visible: root.replyToUser !== ""
-                text: "Replying to " + root.replyToUser
-                color: Qt.darker(root.contentForeground, 1.5)
-                font.family: root.contentFontFamily
-                font.pixelSize: Style.font.caption
-                elide: Text.ElideRight
-              }
-
-              Rectangle {
-                width: parent.width
-                height: Style.space(70)
-                radius: Style.cornerRadius
-                color: Style.controlFill(false, false, root.contentForeground, Color.accent)
-
-                Text {
-                  anchors.left: parent.left
-                  anchors.leftMargin: Style.space(10)
-                  anchors.right: parent.right
-                  anchors.rightMargin: Style.space(10)
-                  anchors.top: parent.top
-                  anchors.topMargin: Style.space(8)
-                  visible: root.composerText === ""
-                  text: root.replyToUser !== "" ? "Write a reply..." : "What's on your mind?"
-                  color: Qt.darker(root.contentForeground, 1.6)
-                  font.family: root.contentFontFamily
-                  font.pixelSize: Style.font.body
-                  wrapMode: Text.WordWrap
-                }
-
-                TextEdit {
-                  id: composerInput
-                  anchors.fill: parent
-                  anchors.margins: Style.space(8)
-                  text: root.composerText
-                  color: root.contentForeground
-                  font.family: root.contentFontFamily
-                  font.pixelSize: Style.font.body
-                  wrapMode: TextEdit.Wrap
-                  selectByMouse: true
-                  onTextEdited: root.composerText = text
-                  Keys.onEscapePressed: function(event) {
-                    if (root.replyToId !== "") root.cancelReply()
-                    keyCatcher.forceActiveFocus()
-                    event.accepted = true
-                  }
-                }
-              }
-
-              Row {
-                spacing: Style.space(8)
-
-                Button {
-                  text: root.posting ? "Posting..." : "Post"
-                  bordered: true
-                  focusable: true
-                  enabled: !root.posting && root.composerText.trim() !== ""
-                  foreground: root.contentForeground
-                  fontFamily: root.contentFontFamily
-                  onClicked: root.postStatus()
-                }
-
-                Button {
-                  visible: root.replyToId !== ""
-                  text: "Cancel"
-                  foreground: root.contentForeground
-                  fontFamily: root.contentFontFamily
-                  onClicked: root.cancelReply()
-                }
-
-                Text {
-                  anchors.verticalCenter: parent.verticalCenter
-                  visible: root.postError !== ""
-                  text: root.postError
-                  color: Color.urgent
-                  font.family: root.contentFontFamily
-                  font.pixelSize: Style.font.caption
-                }
-              }
-            }
-          }
 
           Text {
             visible: root.authed && root.loadingFeed
