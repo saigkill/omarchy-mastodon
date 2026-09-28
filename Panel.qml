@@ -17,7 +17,10 @@ Panel {
   readonly property var auth: hostWidget ? hostWidget.auth : Model.emptyAuth()
   readonly property bool authed: hostWidget ? hostWidget.authed : false
   readonly property string instance: auth.instance || ""
-  readonly property string accessToken: auth.accessToken || ""
+  // mastodon_helper.py owns the access token; it never travels back into
+  // the panel, so there is no accessToken property here to leak.
+  readonly property string helperScript: hostWidget ? hostWidget.helperScript
+    : Qt.resolvedUrl("mastodon_helper.py").toString().replace("file://", "")
 
   property string loginInstance: ""
   readonly property bool loggingIn: hostWidget ? hostWidget.oauthPending : false
@@ -64,7 +67,7 @@ Panel {
 
   function loadCurrentUser() {
     if (!root.authed) return
-    var cmd = Model.verifyCredentialsCmd(root.instance, root.accessToken)
+    var cmd = Model.verifyCredentialsCmd(root.helperScript)
     verifyProc.command = cmd
     verifyProc.running = true
   }
@@ -88,7 +91,7 @@ Panel {
     if (!root.authed) return
     root.loadingFeed = true
     root.feedError = ""
-    var homeCmd = Model.homeTimelineCmd(root.instance, root.accessToken)
+    var homeCmd = Model.homeTimelineCmd(root.helperScript)
     homeProc.command = homeCmd
     homeProc.running = true
   }
@@ -106,7 +109,7 @@ Panel {
   }
 
   function loadLocal() {
-    var localCmd = Model.localTimelineCmd(root.instance, root.accessToken)
+    var localCmd = Model.localTimelineCmd(root.helperScript)
     localProc.command = localCmd
     localProc.running = true
   }
@@ -122,7 +125,7 @@ Panel {
   }
 
   function loadMentions() {
-    var mentionsCmd = Model.mentionsCmd(root.instance, root.accessToken)
+    var mentionsCmd = Model.mentionsCmd(root.helperScript)
     mentionsProc.command = mentionsCmd
     mentionsProc.running = true
   }
@@ -152,15 +155,15 @@ Panel {
     root.loadingMore = true
     if (root.currentTab === 0) {
       moreHomeProc.command = Model.homeTimelineCmd(
-        root.instance, root.accessToken, Model.oldestId(root.homeTimeline))
+        root.helperScript, Model.oldestId(root.homeTimeline))
       moreHomeProc.running = true
     } else if (root.currentTab === 1) {
       moreLocalProc.command = Model.localTimelineCmd(
-        root.instance, root.accessToken, Model.oldestId(root.localTimeline))
+        root.helperScript, Model.oldestId(root.localTimeline))
       moreLocalProc.running = true
     } else {
       moreMentionsProc.command = Model.mentionsCmd(
-        root.instance, root.accessToken, Model.oldestId(root.mentions))
+        root.helperScript, Model.oldestId(root.mentions))
       moreMentionsProc.running = true
     }
   }
@@ -202,7 +205,7 @@ Panel {
       if (ids.indexOf(id) === -1) ids.push(id)
     }
     if (ids.length === 0) return
-    var relCmd = Model.relationshipCmd(root.instance, root.accessToken, ids[0])
+    var relCmd = Model.relationshipCmd(root.helperScript, ids[0])
     relProc.command = relCmd
     relProc.running = true
   }
@@ -228,7 +231,7 @@ Panel {
     if (text === "" || root.posting) return
     root.posting = true
     root.postError = ""
-    var cmd = Model.postStatusCmd(root.instance, root.accessToken, text, root.replyToId || null)
+    var cmd = Model.postStatusCmd(root.helperScript, text, root.replyToId || null)
     postProc.command = cmd
     postProc.running = true
   }
@@ -248,32 +251,32 @@ Panel {
 
   function toggleReblog(status) {
     var cmd = status.reblogged
-      ? Model.unreblogCmd(root.instance, root.accessToken, status.id)
-      : Model.reblogCmd(root.instance, root.accessToken, status.id)
+      ? Model.unreblogCmd(root.helperScript, status.id)
+      : Model.reblogCmd(root.helperScript, status.id)
     actionProc.command = cmd
     actionProc.running = true
   }
 
   function toggleFavourite(status) {
     var cmd = status.favourited
-      ? Model.unfavouriteCmd(root.instance, root.accessToken, status.id)
-      : Model.favouriteCmd(root.instance, root.accessToken, status.id)
+      ? Model.unfavouriteCmd(root.helperScript, status.id)
+      : Model.favouriteCmd(root.helperScript, status.id)
     actionProc.command = cmd
     actionProc.running = true
   }
 
   function toggleBookmark(status) {
     var cmd = status.bookmarked
-      ? Model.unbookmarkCmd(root.instance, root.accessToken, status.id)
-      : Model.bookmarkCmd(root.instance, root.accessToken, status.id)
+      ? Model.unbookmarkCmd(root.helperScript, status.id)
+      : Model.bookmarkCmd(root.helperScript, status.id)
     actionProc.command = cmd
     actionProc.running = true
   }
 
   function toggleFollow(account) {
     var cmd = root.isFollowing(account.id)
-      ? Model.unfollowCmd(root.instance, root.accessToken, account.id)
-      : Model.followCmd(root.instance, root.accessToken, account.id)
+      ? Model.unfollowCmd(root.helperScript, account.id)
+      : Model.followCmd(root.helperScript, account.id)
     actionProc.command = cmd
     actionProc.running = true
   }

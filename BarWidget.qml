@@ -9,18 +9,19 @@ BarWidget {
   id: root
   moduleName: "saigkill.mastodon"
 
-  // State must NOT live inside the plugin directory: Quickshell watches that
-  // folder and reloads the plugin on any write, which destroys an open panel
-  // mid-login.
-  readonly property string dataDir: Quickshell.env("HOME")
-    + "/.local/state/omarchy-mastodon"
-  readonly property string dataFile: dataDir + "/auth.json"
+  // The access token and the client secret never enter this file at all:
+  // mastodon_helper.py owns the 0600 state file and both secrets, so a
+  // crash, a log line or a stray `ps` from another local process cannot
+  // expose them. This file only ever sees the instance, the public client
+  // id, and whether a token exists.
+  readonly property string helperScript: Qt.resolvedUrl("mastodon_helper.py").toString().replace("file://", "")
   readonly property string oauthScript: Qt.resolvedUrl("oauth_server.py").toString().replace("file://", "")
 
   property var auth: Model.emptyAuth()
   readonly property bool authed: Model.isAuthed(auth)
   property string oauthClientId: ""
-  property string oauthClientSecret: ""
+  property string pendingInstance: ""
+  property bool pendingLoginSuccess: false
   property int oauthPort: 0
   property int oauthPortAttempts: 0
   property bool oauthPending: false
@@ -35,50 +36,39 @@ BarWidget {
     : Color.urgent
 
   function loadData() {
-    loadProc.command = ["sh", "-c", 'cat "$1" 2>/dev/null || true', "sh", root.dataFile]
+    loadProc.command = Model.loadCmd(root.helperScript)
     loadProc.running = true
   }
 
-  function applyData(text) {
-    var parsed = null
-    try { parsed = JSON.parse(String(text || "")) } catch (error) { parsed = null }
+  function onLoadExited(exitCode) {
+    var parsed = Model.parseJson(loadOut.text)
     var data = Model.decode(parsed)
     root.auth = data.auth
-  }
-
-  function saveData() {
-    var json = JSON.stringify({ auth: root.auth })
-    saveProc.command = ["sh", "-c",
-      'mkdir -p "$(dirname "$2")" && umask 077 && printf %s "$1" > "$2"',
-      "sh", json, root.dataFile]
-    saveProc.running = true
+    if (root.pendingLoginSuccess) {
+      root.pendingLoginSuccess = false
+      if (panelLoader.item) panelLoader.item.onLoginSuccess()
+    }
   }
 
   function clearAuth() {
-    root.auth = Model.emptyAuth()
     root.oauthClientId = ""
-    root.oauthClientSecret = ""
+    root.pendingInstance = ""
     root.oauthPort = 0
     root.oauthPortAttempts = 0
     root.oauthPending = false
     root.oauthError = ""
-    root.saveData()
+    logoutProc.command = Model.logoutCmd(root.helperScript)
+    logoutProc.running = true
   }
 
-  // `property var` holds a JS object; mutating it in place would not notify
-  // bindings (authed, Panel.auth), so always replace the object.
-  function patchAuth(fields) {
-    var next = {}
-    for (var key in root.auth) next[key] = root.auth[key]
-    for (var name in fields) next[name] = fields[name]
-    root.auth = next
+  function onLogoutExited(exitCode) {
+    root.loadData()
   }
 
   function failOAuth(message) {
     root.oauthPending = false
     root.oauthError = message
   }
-
 
   function startOAuth() {
     var instance = Model.normalizeInstance(panelLoader.item ? panelLoader.item.loginInstance : "")
@@ -87,33 +77,42 @@ BarWidget {
       return
     }
     root.oauthError = ""
-    root.patchAuth({ instance: instance })
     root.oauthPending = true
     root.oauthClientId = ""
-    root.oauthClientSecret = ""
+    root.pendingInstance = instance
     root.oauthPort = Model.randomPort()
     root.oauthPortAttempts = 0
-    root.saveData()
+    // A previous, incomplete login attempt may have left a client id/secret
+    // behind for a different instance. Sending an explicit empty clientId
+    // makes the helper drop it before it is bound to a fresh registration.
+    saveProc.command = Model.saveCmd(root.helperScript)
+    saveProc.environment = ({
+      MASTODON_AUTH_JSON: JSON.stringify({ auth: { instance: instance, clientId: "" } })
+    })
+    saveProc.running = true
+  }
+
+  function onSaveExited(exitCode) {
+    if (exitCode !== 0) {
+      root.failOAuth("Could not save instance")
+      return
+    }
     root.registerApp()
   }
 
   function registerApp() {
-    registerAppProc.command = Model.registerAppCmd(
-      root.auth.instance, Model.callbackUri(root.oauthPort))
+    var redirectUri = Model.callbackUri(root.oauthPort)
+    registerAppProc.command = Model.registerAppCmd(root.helperScript, redirectUri)
     registerAppProc.running = true
   }
 
   function onRegisterAppExited(exitCode) {
-    var raw = registerAppOut.text
-    var parsed = Model.parseJson(raw)
-    if (!parsed || !parsed.client_id || !parsed.client_secret) {
-      root.failOAuth("Could not register app on " + root.auth.instance)
+    var parsed = Model.parseJson(registerAppOut.text)
+    if (exitCode !== 0 || !parsed || !parsed.client_id) {
+      root.failOAuth("Could not register app on " + root.pendingInstance)
       return
     }
     root.oauthClientId = String(parsed.client_id)
-    root.oauthClientSecret = String(parsed.client_secret)
-    root.patchAuth({ clientId: root.oauthClientId, clientSecret: root.oauthClientSecret })
-    root.saveData()
     root.startOAuthServer()
   }
 
@@ -121,7 +120,7 @@ BarWidget {
     var redirectUri = Model.callbackUri(root.oauthPort)
     oauthProc.command = [root.oauthScript, String(root.oauthPort)]
     oauthProc.running = true
-    var authUrl = root.auth.instance
+    var authUrl = root.pendingInstance
       + "/oauth/authorize?response_type=code"
       + "&client_id=" + encodeURIComponent(root.oauthClientId)
       + "&redirect_uri=" + encodeURIComponent(redirectUri)
@@ -149,25 +148,29 @@ BarWidget {
     root.exchangeToken(text)
   }
 
+  // The authorization code is the one secret that has to travel from the
+  // panel to the helper: it is passed through the environment
+  // (MASTODON_OAUTH_CODE), not argv, because /proc/<pid>/environ is
+  // readable only by the owning user while /proc/<pid>/cmdline is not.
   function exchangeToken(code) {
-    exchangeTokenProc.command = Model.exchangeTokenCmd(
-      root.auth.instance, root.oauthClientId, root.oauthClientSecret,
-      code, Model.callbackUri(root.oauthPort))
+    var redirectUri = Model.callbackUri(root.oauthPort)
+    exchangeTokenProc.command = Model.exchangeTokenCmd(root.helperScript, redirectUri)
+    exchangeTokenProc.environment = ({ MASTODON_OAUTH_CODE: code })
     exchangeTokenProc.running = true
   }
 
   function onExchangeTokenExited(exitCode) {
-    var raw = exchangeTokenOut.text
-    var parsed = Model.parseJson(raw)
-    if (!parsed || !parsed.access_token) {
+    var parsed = Model.parseJson(exchangeTokenOut.text)
+    if (exitCode !== 0 || !parsed || parsed.ok !== true) {
       root.failOAuth("Token exchange failed")
       return
     }
-    root.patchAuth({ accessToken: String(parsed.access_token) })
     root.oauthPending = false
     root.oauthError = ""
-    root.saveData()
-    if (panelLoader.item) panelLoader.item.onLoginSuccess()
+    // The token itself is never read back into the panel; loadData() only
+    // ever learns whether one now exists.
+    root.pendingLoginSuccess = true
+    root.loadData()
   }
 
   readonly property bool opened: panelLoader.item ? panelLoader.item.opened === true : false
@@ -243,14 +246,21 @@ BarWidget {
       waitForEnd: true
     }
     onExited: function(exitCode) {
-      root.applyData(loadOut.text)
+      root.onLoadExited(exitCode)
     }
   }
 
   Process {
     id: saveProc
     onExited: function(exitCode) {
-      if (exitCode !== 0) console.warn("saigkill.mastodon: failed to save auth file")
+      root.onSaveExited(exitCode)
+    }
+  }
+
+  Process {
+    id: logoutProc
+    onExited: function(exitCode) {
+      root.onLogoutExited(exitCode)
     }
   }
 

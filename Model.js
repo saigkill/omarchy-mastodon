@@ -4,60 +4,94 @@ var APP_WEBSITE = "https://github.com/saigkill/omarchy-mastodon1"
 var PAGE_SIZE = 40
 var MAX_MEDIA_PER_STATUS = 4
 
+// ------------------------------------------------------------------- instance
+//
+// The panel used to hand curl a bearer token, a client secret and the OAuth
+// authorization code as command line arguments, and shelled out via `sh -c`
+// to write the state file. Command lines live in /proc/<pid>/cmdline, which
+// is world-readable, so every local process could read a Mastodon account's
+// credentials. All of that now lives in mastodon_helper.py: the panel only
+// ever passes it non-secret arguments (an endpoint, a status, a redirect
+// URI), and the helper itself owns the 0600 state file that holds the
+// client secret and the access token.
+//
+// normalizeInstance is the last line of defence against sending a token
+// somewhere it does not belong: it accepts only https, or http to a name
+// that really is this machine (the OAuth loopback callback), and rejects a
+// userinfo component that could make a host look like it belongs to the
+// user when it does not.
+
+function isLoopbackHost(host) {
+  var text = String(host || "").toLowerCase()
+  if (text === "") return false
+  if (text === "localhost") return true
+  if (text === "::1") return true
+  var match = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(text)
+  if (!match) return false
+  for (var i = 1; i <= 4; i++) {
+    if (Number(match[i]) > 255) return false
+  }
+  return Number(match[1]) === 127
+}
+
+// Splits "scheme://authority/rest" without relying on a URL constructor
+// (not reliably available in the QML JS engine). Only http/https survive;
+// any other explicit scheme (ftp:, javascript:, file:) is refused outright
+// instead of being coerced, since prefixing "https://" onto an already
+// schemed string would smuggle the original scheme into the host portion.
 function normalizeInstance(input) {
+  var text = String(input || "").trim().toLowerCase()
+  if (text === "") return ""
+
+  var explicitScheme = /^([a-z][a-z0-9+.-]*):/i.exec(text)
+  if (explicitScheme) {
+    if (explicitScheme[1] !== "http" && explicitScheme[1] !== "https") return ""
+  } else {
+    text = "https://" + text
+  }
+
+  var parsed = /^(https?):\/\/(.*)$/i.exec(text)
+  if (!parsed) return ""
+  var scheme = parsed[1]
+  var afterScheme = parsed[2]
+
+  var slash = afterScheme.indexOf("/")
+  var authority = slash === -1 ? afterScheme : afterScheme.substring(0, slash)
+  var rest = slash === -1 ? "" : afterScheme.substring(slash)
+
+  // A userinfo component ("host@evil.example") makes the real host look
+  // like a username, which is a classic phishing trick against naive host
+  // parsing, so authority is refused outright the moment it contains one.
+  if (authority === "" || authority.indexOf("@") !== -1) return ""
+
+  var host
+  if (authority.charAt(0) === "[") {
+    var close = authority.indexOf("]")
+    if (close === -1) return ""
+    host = authority.substring(1, close)
+  } else {
+    var colon = authority.indexOf(":")
+    host = colon === -1 ? authority : authority.substring(0, colon)
+  }
+  if (host === "") return ""
+
+  // https is always fine. Plaintext http only survives for the loopback
+  // OAuth callback; a token or a private timeline must never go out on the
+  // wire to anything else.
+  if (scheme === "http" && !isLoopbackHost(host)) return ""
+
+  return (scheme + "://" + authority + rest).replace(/\/+$/, "")
+}
+
+// Used only to show the address the user typed back to them (e.g. in a
+// tooltip while login is failing). Unlike normalizeInstance this never
+// rejects anything, so it must never be used to decide where a request is
+// allowed to go.
+function displayInstance(input) {
   var text = String(input || "").trim().toLowerCase()
   if (text === "") return ""
   if (!/^https?:\/\//i.test(text)) text = "https://" + text
   return text.replace(/\/+$/, "")
-}
-
-function apiBase(instance) {
-  return normalizeInstance(instance)
-}
-
-function authHeader(token) {
-  return "Authorization: Bearer " + token
-}
-
-function curlGet(instance, endpoint, token) {
-  return [
-    "curl", "-sS", "-f",
-    "-H", authHeader(token),
-    apiBase(instance) + endpoint
-  ]
-}
-
-function curlPost(instance, endpoint, token, fields) {
-  var cmd = ["curl", "-sS", "-f", "-X", "POST", "-H", authHeader(token)]
-  for (var key in fields) {
-    cmd.push("-F")
-    cmd.push(key + "=" + fields[key])
-  }
-  cmd.push(apiBase(instance) + endpoint)
-  return cmd
-}
-
-function registerAppCmd(instance, redirectUri) {
-  return [
-    "curl", "-sS", "-f", "-X", "POST",
-    "-F", "client_name=" + APP_NAME,
-    "-F", "redirect_uris=" + redirectUri,
-    "-F", "scopes=" + APP_SCOPES,
-    "-F", "website=" + APP_WEBSITE,
-    apiBase(instance) + "/api/v1/apps"
-  ]
-}
-
-function exchangeTokenCmd(instance, clientId, clientSecret, code, redirectUri) {
-  return [
-    "curl", "-sS", "-f", "-X", "POST",
-    "-F", "client_id=" + clientId,
-    "-F", "client_secret=" + clientSecret,
-    "-F", "grant_type=authorization_code",
-    "-F", "code=" + code,
-    "-F", "redirect_uri=" + redirectUri,
-    apiBase(instance) + "/oauth/token"
-  ]
 }
 
 function randomPort() {
@@ -68,9 +102,15 @@ function callbackUri(port) {
   return "http://127.0.0.1:" + Number(port)
 }
 
-function verifyCredentialsCmd(instance, token) {
-  return curlGet(instance, "/api/v1/accounts/verify_credentials", token)
-}
+// ------------------------------------------------------------- helper commands
+//
+// Every command below runs mastodon_helper.py, never curl and never a shell.
+// The instance, the client secret and the access token are not passed as
+// arguments; the helper reads them from its own state file. The one-time
+// OAuth authorization code is handed over through the MASTODON_AUTH_JSON /
+// MASTODON_OAUTH_CODE environment variables instead of argv, since
+// /proc/<pid>/environ (unlike /proc/<pid>/cmdline) is readable only by the
+// owning user.
 
 // Older pages are fetched with max_id, which returns statuses strictly older
 // than the given id, so paging never repeats the current last entry.
@@ -81,87 +121,82 @@ function pagedUrl(endpoint, maxId) {
   return url
 }
 
-function homeTimelineCmd(instance, token, maxId) {
-  return curlGet(instance, pagedUrl("/api/v1/timelines/home", maxId), token)
+function loadCmd(helper) {
+  return [helper, "load"]
 }
 
-function localTimelineCmd(instance, token, maxId) {
-  return curlGet(instance, pagedUrl("/api/v1/timelines/public?local=true", maxId), token)
+function saveCmd(helper) {
+  return [helper, "save"]
 }
 
-function mentionsCmd(instance, token, maxId) {
-  return curlGet(instance, pagedUrl("/api/v1/notifications?types[]=mention", maxId), token)
+function logoutCmd(helper) {
+  return [helper, "logout"]
 }
 
-// Notifications wrap the status in .status, timeline entries are the status
-// itself. Both carry an id, so one accessor covers timelines and mentions.
-function entryId(entry) {
-  var status = entry && entry.status ? entry.status : entry
-  return status && status.id ? String(status.id) : ""
+function registerAppCmd(helper, redirectUri) {
+  return [helper, "register", redirectUri]
 }
 
-function oldestId(list) {
-  if (!Array.isArray(list) || list.length === 0) return ""
-  return entryId(list[list.length - 1])
+function exchangeTokenCmd(helper, redirectUri) {
+  return [helper, "exchange", redirectUri]
 }
 
-// max_id pages can overlap by one entry on some servers, so appending has to
-// de-duplicate instead of blindly concatenating.
-function appendUnique(list, page) {
-  var known = {}
-  var merged = Array.isArray(list) ? list.slice() : []
-  var i
-  for (i = 0; i < merged.length; i++) known[entryId(merged[i])] = true
-  if (!Array.isArray(page)) return merged
-  for (i = 0; i < page.length; i++) {
-    var id = entryId(page[i])
-    if (id === "" || known[id]) continue
-    known[id] = true
-    merged.push(page[i])
-  }
-  return merged
+function verifyCredentialsCmd(helper) {
+  return [helper, "get", "/api/v1/accounts/verify_credentials"]
 }
 
-function postStatusCmd(instance, token, text, inReplyToId) {
-  var fields = { status: text }
-  if (inReplyToId) fields.in_reply_to_id = inReplyToId
-  return curlPost(instance, "/api/v1/statuses", token, fields)
+function homeTimelineCmd(helper, maxId) {
+  return [helper, "get", pagedUrl("/api/v1/timelines/home", maxId)]
 }
 
-function reblogCmd(instance, token, id) {
-  return curlPost(instance, "/api/v1/statuses/" + id + "/reblog", token, {})
+function localTimelineCmd(helper, maxId) {
+  return [helper, "get", pagedUrl("/api/v1/timelines/public?local=true", maxId)]
 }
 
-function unreblogCmd(instance, token, id) {
-  return curlPost(instance, "/api/v1/statuses/" + id + "/unreblog", token, {})
+function mentionsCmd(helper, maxId) {
+  return [helper, "get", pagedUrl("/api/v1/notifications?types[]=mention", maxId)]
 }
 
-function favouriteCmd(instance, token, id) {
-  return curlPost(instance, "/api/v1/statuses/" + id + "/favourite", token, {})
+function relationshipCmd(helper, id) {
+  return [helper, "get", "/api/v1/accounts/relationships[]=" + id]
 }
 
-function unfavouriteCmd(instance, token, id) {
-  return curlPost(instance, "/api/v1/statuses/" + id + "/unfavourite", token, {})
+function postStatusCmd(helper, text, inReplyToId) {
+  var cmd = [helper, "post", "/api/v1/statuses", "status=" + text]
+  if (inReplyToId) cmd.push("in_reply_to_id=" + inReplyToId)
+  return cmd
 }
 
-function bookmarkCmd(instance, token, id) {
-  return curlPost(instance, "/api/v1/statuses/" + id + "/bookmark", token, {})
+function reblogCmd(helper, id) {
+  return [helper, "post", "/api/v1/statuses/" + id + "/reblog"]
 }
 
-function unbookmarkCmd(instance, token, id) {
-  return curlPost(instance, "/api/v1/statuses/" + id + "/unbookmark", token, {})
+function unreblogCmd(helper, id) {
+  return [helper, "post", "/api/v1/statuses/" + id + "/unreblog"]
 }
 
-function followCmd(instance, token, id) {
-  return curlPost(instance, "/api/v1/accounts/" + id + "/follow", token, {})
+function favouriteCmd(helper, id) {
+  return [helper, "post", "/api/v1/statuses/" + id + "/favourite"]
 }
 
-function unfollowCmd(instance, token, id) {
-  return curlPost(instance, "/api/v1/accounts/" + id + "/unfollow", token, {})
+function unfavouriteCmd(helper, id) {
+  return [helper, "post", "/api/v1/statuses/" + id + "/unfavourite"]
 }
 
-function relationshipCmd(instance, token, id) {
-  return curlGet(instance, "/api/v1/accounts/relationships[]=" + id, token)
+function bookmarkCmd(helper, id) {
+  return [helper, "post", "/api/v1/statuses/" + id + "/bookmark"]
+}
+
+function unbookmarkCmd(helper, id) {
+  return [helper, "post", "/api/v1/statuses/" + id + "/unbookmark"]
+}
+
+function followCmd(helper, id) {
+  return [helper, "post", "/api/v1/accounts/" + id + "/follow"]
+}
+
+function unfollowCmd(helper, id) {
+  return [helper, "post", "/api/v1/accounts/" + id + "/unfollow"]
 }
 
 function parseJson(text) {
@@ -317,22 +352,60 @@ function statusMedia(status) {
   return out
 }
 
+// Notifications wrap the status in .status, timeline entries are the status
+// itself. Both carry an id, so one accessor covers timelines and mentions.
+function entryId(entry) {
+  var status = entry && entry.status ? entry.status : entry
+  return status && status.id ? String(status.id) : ""
+}
+
+function oldestId(list) {
+  if (!Array.isArray(list) || list.length === 0) return ""
+  return entryId(list[list.length - 1])
+}
+
+// max_id pages can overlap by one entry on some servers, so appending has to
+// de-duplicate instead of blindly concatenating.
+function appendUnique(list, page) {
+  var known = {}
+  var merged = Array.isArray(list) ? list.slice() : []
+  var i
+  for (i = 0; i < merged.length; i++) known[entryId(merged[i])] = true
+  if (!Array.isArray(page)) return merged
+  for (i = 0; i < page.length; i++) {
+    var id = entryId(page[i])
+    if (id === "" || known[id]) continue
+    known[id] = true
+    merged.push(page[i])
+  }
+  return merged
+}
+
+// ----------------------------------------------------------------------- auth
+//
+// This is the panel's only view of the credentials: an instance, a public
+// client id, and whether a token exists. The client secret and the access
+// token are owned entirely by mastodon_helper.py and never cross back into
+// the panel, so a bug or a crash here cannot leak either of them.
+
 function emptyAuth() {
-  return { instance: "", clientId: "", clientSecret: "", accessToken: "" }
+  return { instance: "", clientId: "", hasToken: false }
 }
 
 function decodeAuth(data) {
   if (!data || typeof data !== "object") return emptyAuth()
+  // Built field by field instead of spread/assign, so a secret slipped into
+  // the input object (e.g. a stale accessToken/clientSecret) cannot ride
+  // along into the decoded result.
   return {
     instance: String(data.instance || ""),
     clientId: String(data.clientId || ""),
-    clientSecret: String(data.clientSecret || ""),
-    accessToken: String(data.accessToken || "")
+    hasToken: data.hasToken === true
   }
 }
 
 function isAuthed(auth) {
-  return !!(auth && auth.instance && auth.accessToken)
+  return !!(auth && auth.instance && auth.hasToken === true)
 }
 
 function emptyData() {
@@ -348,15 +421,21 @@ if (typeof module !== "undefined") {
   module.exports = {
     APP_NAME: APP_NAME,
     APP_SCOPES: APP_SCOPES,
+    APP_WEBSITE: APP_WEBSITE,
     normalizeInstance: normalizeInstance,
-    registerAppCmd: registerAppCmd,
-    exchangeTokenCmd: exchangeTokenCmd,
+    displayInstance: displayInstance,
     randomPort: randomPort,
     callbackUri: callbackUri,
+    loadCmd: loadCmd,
+    saveCmd: saveCmd,
+    logoutCmd: logoutCmd,
+    registerAppCmd: registerAppCmd,
+    exchangeTokenCmd: exchangeTokenCmd,
     verifyCredentialsCmd: verifyCredentialsCmd,
     homeTimelineCmd: homeTimelineCmd,
     localTimelineCmd: localTimelineCmd,
     mentionsCmd: mentionsCmd,
+    relationshipCmd: relationshipCmd,
     postStatusCmd: postStatusCmd,
     reblogCmd: reblogCmd,
     unreblogCmd: unreblogCmd,
@@ -366,7 +445,6 @@ if (typeof module !== "undefined") {
     unbookmarkCmd: unbookmarkCmd,
     followCmd: followCmd,
     unfollowCmd: unfollowCmd,
-    relationshipCmd: relationshipCmd,
     parseJson: parseJson,
     stripHtml: stripHtml,
     formatTime: formatTime,
