@@ -374,7 +374,7 @@ Panel {
             }
 
             PanelActionButton {
-              iconText: "\uf09b"
+              iconText: "\uf08b"
               tooltipText: "Logout"
               foreground: root.contentForeground
               fontFamily: root.contentFontFamily
@@ -809,7 +809,7 @@ Panel {
                     spacing: Style.space(4)
 
                     PanelActionButton {
-                      iconText: "\uf079"
+                      iconText: "\uf112"
                       tooltipText: "Reply"
                       foreground: root.contentForeground
                       fontFamily: root.contentFontFamily
@@ -817,7 +817,7 @@ Panel {
                     }
 
                     PanelActionButton {
-                      iconText: "\uf0e4"
+                      iconText: "\uf079"
                       tooltipText: (modelData.status || modelData).reblogged ? "Unreblog" : "Reblog"
                       foreground: (modelData.status || modelData).reblogged ? Color.accent : root.contentForeground
                       fontFamily: root.contentFontFamily

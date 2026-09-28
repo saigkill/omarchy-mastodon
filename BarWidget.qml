@@ -220,7 +220,10 @@ BarWidget {
     id: button
     anchors.fill: parent
     bar: root.bar
-    text: "\uf466"
+    // U+EDC0 is the Nerd Font mapping for fa-mastodon. The plain Font
+    // Awesome codepoint U+F4F6 is taken by oct-note in JetBrainsMono Nerd
+    // Font, and the previous U+F466 rendered as oct-mute (a speaker).
+    text: "\uEDC0"
     slotSize: Style.bar.statusSlot
     fontSize: Style.font.caption
     active: false
