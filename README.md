@@ -10,6 +10,8 @@ Mastodon client for the Omarchy Quattro bar with OAuth login, timelines and inte
   - **OAuth login** — enter your instance, authorize in the browser, and the token is saved permanently
   - **Three tabs** — Home, Local, Mentions
   - **Composer** — single composer box, available in every tab
+  - **Character limit** — the counter next to the Post button shows `23/500`, and
+    the field refuses a character more than the instance allows
   - **Replies** — the reply button on a status scrolls back to the composer, shows
     "Replying to @user" and focuses the field. <kbd>Esc</kbd> cancels the reply and
     returns keyboard navigation to the feed
@@ -39,7 +41,7 @@ from jumping around while you scroll:
 
 ├──────────────────────────────┤
 │ What's on your mind?         │  composer      stays put
-│ [ Post ]                      │
+│ [ Post ]               23/500│
 ├──────────────────────────────┤
 │  ▢ 10:24  @someone           │  ┐
 │  status text …                │  │ the feed scrolls,
@@ -52,7 +54,8 @@ Only the feed is inside the scroll area, so the composer is always visible and
 ready to type into without scrolling back up. The trade-off is that the fixed
 part takes about 200 px of the panel height, leaving roughly 450 px for posts.
 To change the total height, edit `Style.space(700)` in `Panel.qml` (the
-`contentHeight` of the `KeyboardPanel`).
+`contentHeight` of the `KeyboardPanel`). The composer box itself keeps its 70px
+and scrolls its own text once a status outgrows it.
 
 ## OAuth flow
 
@@ -110,6 +113,7 @@ See `mastodon_helper.py`'s module docstring for the full reasoning, and
 - `POST /api/v1/apps` — register OAuth app
 - `POST /oauth/token` — exchange code for token
 - `GET /api/v1/accounts/verify_credentials` — current user
+- `GET /api/v2/instance` — the instance's own character limit
 - `GET /api/v1/timelines/home` — home timeline
 - `GET /api/v1/timelines/public?local=true` — local timeline
 - `GET /api/v1/notifications?types[]=mention` — mentions
@@ -124,13 +128,46 @@ Timelines are requested with `limit=40`, and older pages with `max_id` set to th
 oldest id currently held. Overlapping pages are de-duplicated, and a failed page
 is not mistaken for the end of the timeline.
 
+## The composer character limit
+
+Mastodon's default is **500 characters** per status, but the limit is instance
+configuration (`MAX_CHARACTERS`) and administrators do raise or lower it. The
+panel therefore asks the instance itself (`configuration.statuses.max_characters`
+in `GET /api/v2/instance`, fetched once per login) and uses whatever comes back,
+falling back to 500 when the instance reports nothing usable.
+
+The counter is `used/limit` and turns red once the limit is reached. The
+composer cuts the overflow in its `textEdited` handler, so typing, pasting and
+drag and drop all stop at the limit instead of producing a post the instance
+answers with a 422. (`TextEdit` has no `maxLength` in Qt 6 — only `TextInput`
+has one, and the composer has to wrap — and an imperative write to a bound
+`text` property would drop the binding for good, which is why the field is
+synced through `setComposerText()` instead of `text: composerText`.) The status
+is cut once more in `postStatusCmd()`, the one place every post passes through.
+
+## The scrolling composer
+
+The composer box is a fixed 70px tall, which is about four lines. A full status
+is longer than that, so the box scrolls: the field sits in a `ScrollView` (the
+same pattern the monitor and audio panels use) and the scrollbar only appears
+once the text is taller than the box.
+
+A `TextEdit` alone cannot do this. In Qt 6 it has `contentHeight` but no
+`contentY`, so it is not a `Flickable` and simply cuts everything below the
+last visible line off. `TextArea` is used instead: it is a `TextEdit` subclass
+that reports its wrapped height as `implicitHeight`, and that number is what
+gives the scroll view something to scroll. The flickable is only `interactive`
+while there is something to scroll, otherwise its drag would swallow the drag
+that selects text, and both the scroll view and the field have an empty
+`background` so the themed box and the placeholder underneath stay visible.
+
 ## Files and where state lives
 
 | Path | What it is |
 | --- | --- |
 | `Panel.qml` | Panel UI: header, tabs, composer, feed, cards, media |
 | `BarWidget.qml` | Bar slot, icon button, OAuth orchestration |
-| `Model.js` | Pure helpers: command builders, paging, HTML/URL sanitising, media extraction. Holds no credential. |
+| `Model.js` | Pure helpers: command builders, paging, HTML/URL sanitising, media extraction, character limit parsing. Holds no credential. |
 | `mastodon_helper.py` | Owns every credential: talks to the Mastodon API and reads/writes the state file. See "Credential handling" above |
 | `oauth_server.py` | Local HTTP callback server used during login |
 | `manifest.json` | Omarchy plugin manifest (id, entry points, bar placement) |

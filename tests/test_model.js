@@ -31,6 +31,7 @@ function test(name, body) {
 // if it ever ended up somewhere it does not belong.
 const COMMANDS = {
   "verifyCredentialsCmd": Model.verifyCredentialsCmd(HELPER),
+  "instanceConfigCmd": Model.instanceConfigCmd(HELPER),
   "homeTimelineCmd": Model.homeTimelineCmd(HELPER),
   "homeTimelineCmd paged": Model.homeTimelineCmd(HELPER, "110000000000000001"),
   "localTimelineCmd": Model.localTimelineCmd(HELPER),
@@ -108,6 +109,144 @@ test("mentions keep their query separator", function () {
   assert.strictEqual(
     Model.mentionsCmd(HELPER)[2],
     "/api/v1/notifications?types[]=mention&limit=40")
+})
+
+// --------------------------------------------------------- character limit
+
+test("the instance is asked for its own character limit", function () {
+  assert.deepStrictEqual(Model.instanceConfigCmd(HELPER), [
+    HELPER, "get", "/api/v2/instance",
+  ])
+})
+
+test("the limit an instance reports is the one the composer uses", function () {
+  const instance = function (max) {
+    return { configuration: { statuses: { max_characters: max } } }
+  }
+  // Mastodon's own default, and instances that raised or lowered it.
+  assert.strictEqual(Model.parseMaxCharacters(instance(500)), 500)
+  assert.strictEqual(Model.parseMaxCharacters(instance(400)), 400)
+  assert.strictEqual(Model.parseMaxCharacters(instance(5000)), 5000)
+  assert.strictEqual(Model.parseMaxCharacters(instance(1)), 1)
+  // A limit that arrives as a number in a string or a float is still a limit.
+  assert.strictEqual(Model.parseMaxCharacters(instance("750")), 750)
+  assert.strictEqual(Model.parseMaxCharacters(instance(500.7)), 500)
+})
+
+test("a missing or nonsensical limit falls back to the default", function () {
+  const fallback = Model.DEFAULT_MAX_CHARACTERS
+  assert.strictEqual(Model.parseMaxCharacters(null), fallback)
+  assert.strictEqual(Model.parseMaxCharacters(undefined), fallback)
+  assert.strictEqual(Model.parseMaxCharacters("500"), fallback)
+  assert.strictEqual(Model.parseMaxCharacters({}), fallback)
+  assert.strictEqual(Model.parseMaxCharacters({ configuration: null }), fallback)
+  assert.strictEqual(Model.parseMaxCharacters({ configuration: {} }), fallback)
+  assert.strictEqual(
+    Model.parseMaxCharacters({ configuration: { statuses: {} } }), fallback)
+  // Zero or negative would make the composer refuse every keystroke, an
+  // absurd value would allow posts the instance then rejects.
+  assert.strictEqual(Model.parseMaxCharacters({ configuration: { statuses: { max_characters: 0 } } }), fallback)
+  assert.strictEqual(Model.parseMaxCharacters({ configuration: { statuses: { max_characters: -5 } } }), fallback)
+  assert.strictEqual(Model.parseMaxCharacters({ configuration: { statuses: { max_characters: 1e9 } } }), fallback)
+  assert.strictEqual(Model.parseMaxCharacters({ configuration: { statuses: { max_characters: "many" } } }), fallback)
+  assert.strictEqual(Model.parseMaxCharacters({ configuration: { statuses: { max_characters: null } } }), fallback)
+  assert.strictEqual(Model.parseMaxCharacters({ configuration: { statuses: [] } }), fallback)
+  assert.strictEqual(fallback, 500)
+})
+
+test("the composer is capped at the limit and counts what is in it", function () {
+  const panel = fs.readFileSync(path.join(__dirname, "..", "Panel.qml"), "utf8")
+  // TextEdit has no maxLength property in Qt 6 (only TextInput has one, and
+  // the composer has to wrap). Assigning it makes the whole panel fail to
+  // load, so the clamping has to happen in the textEdited handler instead.
+  assert.ok(!/maxLength\s*:/.test(panel),
+    "Panel.qml must not assign maxLength, TextEdit has no such property")
+  assert.ok(/Model\.limitText\(text,\s*root\.maxCharacters\)/.test(panel),
+    "the composer must cut an over-long text where it accepts input")
+  assert.ok(/root\.composerLength\s*\+\s*"\/"\s*\+\s*root\.maxCharacters/.test(panel),
+    "the composer must show a used/total counter")
+})
+
+test("the composer scrolls instead of cutting the text off", function () {
+  const panel = fs.readFileSync(path.join(__dirname, "..", "Panel.qml"), "utf8")
+
+  function block(source, from) {
+    assert.ok(from >= 0, "Panel.qml should contain the block that starts at " + from)
+    let depth = 0
+    for (let i = source.indexOf("{", from); i < source.length; i += 1) {
+      if (source[i] === "{") depth += 1
+      else if (source[i] === "}") {
+        depth -= 1
+        if (depth === 0) return source.slice(from, i + 1)
+      }
+    }
+    throw new Error("unbalanced block at " + from)
+  }
+
+  const scroll = block(panel, panel.lastIndexOf("ScrollView {", panel.indexOf("id: composerScroll")))
+  const field = block(scroll, scroll.indexOf("TextArea {"))
+
+  // A TextEdit has contentHeight but no contentY in Qt 6, so on its own it
+  // cannot scroll: a long status simply disappears below the last visible
+  // line. The ScrollView is what gives the composer a scroll range.
+  assert.ok(/clip:\s*true/.test(scroll), "the scroll view must clip its content")
+  assert.ok(/background:\s*Item\s*\{\s*\}/.test(scroll),
+    "a default background would paint over the themed box and the placeholder")
+  assert.ok(/ScrollBar\.horizontal\.policy:\s*ScrollBar\.AlwaysOff/.test(scroll),
+    "the composer only scrolls vertically")
+  assert.ok(/ScrollBar\.vertical\.policy:[\s\S]*ScrollBar\.AsNeeded\s*:\s*ScrollBar\.AlwaysOff/.test(scroll),
+    "the scrollbar may only appear when there is something to scroll")
+  assert.ok(/property:\s*"interactive"/.test(scroll),
+    "an always interactive flickable would swallow the drag that selects text")
+
+  // TextArea, not TextEdit: only TextArea reports its wrapped height as
+  // implicitHeight, and that is the number the ScrollView scrolls.
+  assert.ok(/TextArea\s*\{\s*id:\s*composerInput/.test(field),
+    "the composer field has to be a TextArea")
+  assert.ok(/padding:\s*0/.test(field), "the field must not add its own insets")
+  assert.ok(/height:\s*Math\.max\(implicitHeight,\s*composerScroll\.availableHeight\)/.test(field),
+    "the field has to grow with its text")
+  assert.ok(!/anchors\./.test(field),
+    "an anchored field inside a ScrollView fights it over the size")
+})
+
+test("a post is cut to the limit as well", function () {
+  const long = "x".repeat(600)
+  const cmd = Model.postStatusCmd(HELPER, long, null, 500)
+  assert.strictEqual(cmd[3], "status=" + "x".repeat(500))
+  // Without a known limit nothing is cut, so the composer keeps the last word.
+  assert.strictEqual(Model.postStatusCmd(HELPER, long, null)[3], "status=" + long)
+  assert.strictEqual(
+    Model.postStatusCmd(HELPER, "hello world", null, 500)[3], "status=hello world")
+})
+
+test("limitText cuts to the limit and leaves the rest alone", function () {
+  assert.strictEqual(Model.limitText("hello", 500), "hello")
+  assert.strictEqual(Model.limitText("hello", 5), "hello")
+  assert.strictEqual(Model.limitText("hello", 4), "hell")
+  assert.strictEqual(Model.limitText("", 500), "")
+  assert.strictEqual(Model.limitText("hello", 500.9), "hello")
+  // A limit that is not usable must not empty the composer, otherwise a bad
+  // value from the instance would make the panel impossible to type in.
+  assert.strictEqual(Model.limitText("hello", 0), "hello")
+  assert.strictEqual(Model.limitText("hello", -1), "hello")
+  assert.strictEqual(Model.limitText("hello", NaN), "hello")
+  assert.strictEqual(Model.limitText("hello", undefined), "hello")
+  assert.strictEqual(Model.limitText("hello", "nonsense"), "hello")
+  assert.strictEqual(Model.limitText(undefined, 5), "")
+  assert.strictEqual(Model.limitText(null, 5), "")
+  assert.strictEqual(Model.limitText(12345, 3), "123")
+  // Newlines are characters too and have to be counted.
+  assert.strictEqual(Model.limitText("a\nb\nc", 3), "a\nb")
+})
+
+test("an emoji is counted as two, which is the safe direction", function () {
+  // JS counts UTF-16 units, Mastodon counts characters, so a surrogate pair
+  // must never make the counter claim there is more room than there is.
+  const emoji = "\ud83d\ude00"
+  assert.strictEqual(emoji.length, 2)
+  assert.strictEqual(Model.limitText(emoji.repeat(3), 5).length, 4)
+  assert.ok(Model.limitText(emoji.repeat(3), 5).length >= 3)
 })
 
 // ------------------------------------------------------------- reblog/boost

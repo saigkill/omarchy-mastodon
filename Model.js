@@ -6,6 +6,12 @@ var APP_SCOPES = "read write follow"
 var PAGE_SIZE = 40
 var MAX_MEDIA_PER_STATUS = 4
 
+// Mastodon's own default is 500 characters per status, but the limit is
+// instance configuration and administrators do raise or lower it, so the real
+// value is read from the instance (see parseMaxCharacters) and this is only the
+// fallback for an instance that reports no limit of its own.
+var DEFAULT_MAX_CHARACTERS = 500
+
 // ------------------------------------------------------------------- instance
 //
 // The panel used to hand curl a bearer token, a client secret and the OAuth
@@ -147,6 +153,57 @@ function verifyCredentialsCmd(helper) {
   return [helper, "get", "/api/v1/accounts/verify_credentials"]
 }
 
+// The instance describes itself, including the character limit it enforces on
+// statuses, in configuration.statuses.max_characters. /api/v2/instance is used
+// rather than the v1 alias because v2 is the documented home of the
+// configuration object.
+function instanceConfigCmd(helper) {
+  return [helper, "get", "/api/v2/instance"]
+}
+
+// The reply is instance-controlled data, so the limit is only taken when it is
+// a plain number in a range a real instance can plausibly report. A zero or
+// negative limit would make the composer reject every keystroke, and an absurd
+// one would let a status be composed that the instance then refuses to post;
+// both fall back to the default instead.
+function parseMaxCharacters(data) {
+  if (!data || typeof data !== "object") return DEFAULT_MAX_CHARACTERS
+  var configuration = data.configuration
+  if (!configuration || typeof configuration !== "object") return DEFAULT_MAX_CHARACTERS
+  var statuses = configuration.statuses
+  if (!statuses || typeof statuses !== "object") return DEFAULT_MAX_CHARACTERS
+  var value = Number(statuses.max_characters)
+  if (!isFinite(value)) return DEFAULT_MAX_CHARACTERS
+  var limit = Math.floor(value)
+  if (limit < 1 || limit > 100000) return DEFAULT_MAX_CHARACTERS
+  return limit
+}
+
+// The composer's text, cut to what the instance will accept. The instance
+// refuses a longer status with a 422, and the panel cuts it rather than
+// letting the user build a post that cannot be sent.
+//
+// A limit that is not a usable number leaves the text alone: an empty composer
+// must not turn into a panel where nothing can be typed at all.
+//
+// JS counts UTF-16 code units, so a character outside the basic multilingual
+// plane (an emoji) counts as two here and as one on the server, which counts
+// characters. The counter can therefore claim the limit is reached a little
+// early, but it can never let through a status the instance would reject.
+function limitText(text, max) {
+  var value = String(text === undefined || text === null ? "" : text)
+  var limit = Number(max)
+  if (!isFinite(limit) || limit < 1) return value
+  var count = Math.floor(limit)
+  if (value.length <= count) return value
+  var cut = value.substring(0, count)
+  // Cutting between the two halves of a surrogate pair would leave a broken
+  // character in the field and in the post, so the pair is dropped whole.
+  var last = cut.charCodeAt(cut.length - 1)
+  if (last >= 0xD800 && last <= 0xDBFF) cut = cut.substring(0, cut.length - 1)
+  return cut
+}
+
 function homeTimelineCmd(helper, maxId) {
   return [helper, "get", pagedUrl("/api/v1/timelines/home", maxId)]
 }
@@ -163,8 +220,12 @@ function relationshipCmd(helper, id) {
   return [helper, "get", "/api/v1/accounts/relationships[]=" + id]
 }
 
-function postStatusCmd(helper, text, inReplyToId) {
-  var cmd = [helper, "post", "/api/v1/statuses", "status=" + text]
+// The status is cut to the limit here as well as in the composer: this is the
+// one place every post passes through, so an instance that lowers its limit
+// between loading the configuration and pressing Post still gets something it
+// will accept rather than a 422.
+function postStatusCmd(helper, text, inReplyToId, maxCharacters) {
+  var cmd = [helper, "post", "/api/v1/statuses", "status=" + limitText(text, maxCharacters)]
   if (inReplyToId) cmd.push("in_reply_to_id=" + inReplyToId)
   return cmd
 }
@@ -466,6 +527,9 @@ if (typeof module !== "undefined") {
     registerAppCmd: registerAppCmd,
     exchangeTokenCmd: exchangeTokenCmd,
     verifyCredentialsCmd: verifyCredentialsCmd,
+    instanceConfigCmd: instanceConfigCmd,
+    parseMaxCharacters: parseMaxCharacters,
+    limitText: limitText,
     homeTimelineCmd: homeTimelineCmd,
     localTimelineCmd: localTimelineCmd,
     mentionsCmd: mentionsCmd,
@@ -497,6 +561,7 @@ if (typeof module !== "undefined") {
     oldestId: oldestId,
     appendUnique: appendUnique,
     PAGE_SIZE: PAGE_SIZE,
+    DEFAULT_MAX_CHARACTERS: DEFAULT_MAX_CHARACTERS,
     emptyAuth: emptyAuth,
     decodeAuth: decodeAuth,
     isAuthed: isAuthed,

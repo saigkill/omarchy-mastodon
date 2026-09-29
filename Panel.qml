@@ -1,4 +1,5 @@
 import QtQuick
+import QtQuick.Controls
 import Quickshell
 import Quickshell.Io
 import qs.Commons
@@ -48,6 +49,26 @@ Panel {
   property bool posting: false
   property string postError: ""
 
+  // The character limit the instance enforces, read from the instance itself
+  // because 500 is only Mastodon's default. Until the answer arrives (and for
+  // an instance that reports none) the default is used, so the composer is
+  // never briefly unlimited.
+  property int maxCharacters: Model.DEFAULT_MAX_CHARACTERS
+  property bool instanceConfigLoaded: false
+  readonly property int composerLength: root.composerText.length
+
+  // The composer text lives on the panel, the field is kept in step through
+  // this one function. A `text: root.composerText` binding would be the
+  // obvious way to do it, but cutting an over-long text is an imperative write
+  // and an imperative write to a bound property drops the binding for good —
+  // clearing the composer after posting would then silently stop working. The
+  // binding cannot be put back from inside a signal handler either, so the
+  // field is not bound and everything goes through here.
+  function setComposerText(value) {
+    root.composerText = value
+    if (composerInput && composerInput.text !== value) composerInput.text = value
+  }
+
   property string feedError: ""
   property bool loadingFeed: false
 
@@ -62,6 +83,7 @@ Panel {
 
   function onLoginSuccess() {
     root.loadCurrentUser()
+    root.loadInstanceConfig()
     root.loadTimelines()
   }
 
@@ -77,11 +99,32 @@ Panel {
     if (parsed) root.currentUser = parsed
   }
 
+  // Fetched once per instance, not once per panel open: a composer limit is
+  // not something that changes while a panel is open, and every extra call is
+  // a process the instance has to answer.
+  function loadInstanceConfig() {
+    if (root.instanceConfigLoaded || !root.authed) return
+    var cmd = Model.instanceConfigCmd(root.helperScript)
+    instanceProc.command = cmd
+    instanceProc.running = true
+  }
+
+  function onInstanceConfigExited(exitCode) {
+    // A failed request is simply not marked as loaded, so the next panel open
+    // tries again rather than leaving a limit the user cannot compose under.
+    if (exitCode !== 0) return
+    var parsed = Model.parseJson(instanceConfigOut.text)
+    if (!parsed || typeof parsed !== "object") return
+    root.maxCharacters = Model.parseMaxCharacters(parsed)
+    root.instanceConfigLoaded = true
+  }
+
   // The panel object outlives the login that populated it, and a shell restart
   // rebuilds it empty, so an empty feed is filled on the first open. A feed that
   // already has entries is left alone to avoid a request on every open.
   onOpenedChanged: {
     if (!root.opened || !root.authed) return
+    root.loadInstanceConfig()
     if (root.loadingFeed || !root.feedEmpty) return
     root.loadCurrentUser()
     root.loadTimelines()
@@ -234,7 +277,8 @@ Panel {
     if (text === "" || root.posting) return
     root.posting = true
     root.postError = ""
-    var cmd = Model.postStatusCmd(root.helperScript, text, root.replyToId || null)
+    var cmd = Model.postStatusCmd(root.helperScript, text, root.replyToId || null,
+      root.maxCharacters)
     postProc.command = cmd
     postProc.running = true
   }
@@ -243,7 +287,7 @@ Panel {
     root.posting = false
     var parsed = Model.parseJson(postOut.text)
     if (parsed && parsed.id) {
-      root.composerText = ""
+      root.setComposerText("")
       root.replyToId = ""
       root.replyToUser = ""
       root.loadTimelines()
@@ -291,7 +335,7 @@ Panel {
   function startReply(status) {
     root.replyToId = status.id
     root.replyToUser = Model.accountHandle(status.account)
-    root.composerText = ""
+    root.setComposerText("")
     Qt.callLater(root.focusComposer)
   }
 
@@ -305,7 +349,7 @@ Panel {
   function cancelReply() {
     root.replyToId = ""
     root.replyToUser = ""
-    root.composerText = ""
+    root.setComposerText("")
     if (keyCatcher) keyCatcher.forceActiveFocus()
   }
 
@@ -316,9 +360,12 @@ Panel {
     root.localTimeline = []
     root.mentions = []
     root.relationships = {}
-    root.composerText = ""
+    root.setComposerText("")
     root.replyToId = ""
     root.replyToUser = ""
+    // The next login can be a different instance with a different limit.
+    root.maxCharacters = Model.DEFAULT_MAX_CHARACTERS
+    root.instanceConfigLoaded = false
   }
 
   KeyboardPanel {
@@ -543,51 +590,120 @@ Panel {
                 wrapMode: Text.WordWrap
               }
 
-              TextEdit {
-                id: composerInput
+              // The box is a fixed 70px tall, so a long status has more
+              // lines than fit. A TextEdit on its own cannot be scrolled in
+              // Qt 6: it has contentHeight but no contentY, so everything
+              // below the last visible line is simply cut off. The
+              // ScrollView is what turns those lines into a scroll range,
+              // the same way the monitor and audio panels scroll theirs.
+              ScrollView {
+                id: composerScroll
                 anchors.fill: parent
                 anchors.margins: Style.space(8)
-                text: root.composerText
-                color: root.contentForeground
-                font.family: root.contentFontFamily
-                font.pixelSize: Style.font.body
-                wrapMode: TextEdit.Wrap
-                selectByMouse: true
-                onTextEdited: root.composerText = text
-                Keys.onEscapePressed: function(event) {
-                  if (root.replyToId !== "") root.cancelReply()
-                  keyCatcher.forceActiveFocus()
-                  event.accepted = true
+                clip: true
+                // The themed Rectangle underneath draws the box, a default
+                // background would paint over it and over the placeholder.
+                background: Item {}
+                ScrollBar.horizontal.policy: ScrollBar.AlwaysOff
+                ScrollBar.vertical.policy: composerInput.implicitHeight > composerScroll.height
+                  ? ScrollBar.AsNeeded : ScrollBar.AlwaysOff
+                Binding {
+                  target: composerScroll.contentItem
+                  property: "interactive"
+                  // An interactive flickable would swallow the drag that
+                  // selects text as soon as there is something to scroll.
+                  value: composerInput.implicitHeight > composerScroll.height
+                }
+
+                TextArea {
+                  id: composerInput
+                  width: composerScroll.availableWidth
+                  height: Math.max(implicitHeight, composerScroll.availableHeight)
+                  // TextArea is a TextEdit that reports its wrapped height as
+                  // implicitHeight, and that number is what the ScrollView
+                  // turns into a scroll range. A plain TextEdit has no usable
+                  // implicit size, so nothing would scroll.
+                  background: Item {}
+                  padding: 0
+                  color: root.contentForeground
+                  font.family: root.contentFontFamily
+                  font.pixelSize: Style.font.body
+                  wrapMode: TextEdit.Wrap
+                  selectByMouse: true
+                  onTextEdited: {
+                    // The instance answers a status longer than its limit with a
+                    // 422, so the overflow is cut here and never reaches the
+                    // post. TextEdit has no maxLength of its own (only
+                    // TextInput has one, and the composer has to wrap), so
+                    // typing, pasting and drag and drop are all clamped by hand.
+                    var limited = Model.limitText(text, root.maxCharacters)
+                    if (limited !== text) {
+                      var cursor = cursorPosition
+                      text = limited
+                      cursorPosition = Math.min(cursor, limited.length)
+                    }
+                    root.setComposerText(limited)
+                  }
+                  Keys.onEscapePressed: function(event) {
+                    if (root.replyToId !== "") root.cancelReply()
+                    keyCatcher.forceActiveFocus()
+                    event.accepted = true
+                  }
                 }
               }
             }
 
-            Row {
-              spacing: Style.space(8)
+            // Buttons from the left, the counter against the right edge. A Row
+            // cannot do this on its own: the free space in a Row is only known
+            // after the last child has been placed, so the counter would have
+            // to be anchored inside the positioner.
+            Item {
+              id: composerActions
+              width: parent.width
+              height: Math.max(buttonRow.implicitHeight, composerCounter.height)
 
-              Button {
-                text: root.posting ? "Posting..." : "Post"
-                bordered: true
-                focusable: true
-                enabled: !root.posting && root.composerText.trim() !== ""
-                foreground: root.contentForeground
-                fontFamily: root.contentFontFamily
-                onClicked: root.postStatus()
-              }
+              Row {
+                id: buttonRow
+                anchors.left: parent.left
+                anchors.verticalCenter: parent.verticalCenter
+                spacing: Style.space(8)
 
-              Button {
-                visible: root.replyToId !== ""
-                text: "Cancel"
-                foreground: root.contentForeground
-                fontFamily: root.contentFontFamily
-                onClicked: root.cancelReply()
+                Button {
+                  text: root.posting ? "Posting..." : "Post"
+                  bordered: true
+                  focusable: true
+                  enabled: !root.posting && root.composerText.trim() !== ""
+                  foreground: root.contentForeground
+                  fontFamily: root.contentFontFamily
+                  onClicked: root.postStatus()
+                }
+
+                Button {
+                  visible: root.replyToId !== ""
+                  text: "Cancel"
+                  foreground: root.contentForeground
+                  fontFamily: root.contentFontFamily
+                  onClicked: root.cancelReply()
+                }
+
+                Text {
+                  anchors.verticalCenter: parent.verticalCenter
+                  visible: root.postError !== ""
+                  text: root.postError
+                  color: Color.urgent
+                  font.family: root.contentFontFamily
+                  font.pixelSize: Style.font.caption
+                }
               }
 
               Text {
+                id: composerCounter
+                anchors.right: parent.right
                 anchors.verticalCenter: parent.verticalCenter
-                visible: root.postError !== ""
-                text: root.postError
-                color: Color.urgent
+                text: root.composerLength + "/" + root.maxCharacters
+                color: root.composerLength >= root.maxCharacters
+                  ? Color.urgent
+                  : Qt.darker(root.contentForeground, 1.7)
                 font.family: root.contentFontFamily
                 font.pixelSize: Style.font.caption
               }
@@ -955,6 +1071,17 @@ Panel {
     }
     onExited: function(exitCode) {
       root.onVerifyExited(exitCode)
+    }
+  }
+
+  Process {
+    id: instanceProc
+    stdout: StdioCollector {
+      id: instanceConfigOut
+      waitForEnd: true
+    }
+    onExited: function(exitCode) {
+      root.onInstanceConfigExited(exitCode)
     }
   }
 
