@@ -110,6 +110,55 @@ test("mentions keep their query separator", function () {
     "/api/v1/notifications?types[]=mention&limit=40")
 })
 
+// ------------------------------------------------------------- reblog/boost
+
+test("displayStatus unwraps a boost to the original post", function () {
+  const original = { id: "1", content: "hi", media_attachments: [{ url: "https://x/1.png", preview_url: "https://x/1.png" }] }
+  const boost = { id: "2", content: "", media_attachments: [], account: { id: "9" }, reblog: original }
+  assert.strictEqual(Model.displayStatus(boost), original)
+  assert.strictEqual(Model.displayStatus({ status: boost }), original)
+})
+
+test("displayStatus leaves a plain post untouched", function () {
+  const status = { id: "1", content: "hi" }
+  assert.strictEqual(Model.displayStatus(status), status)
+  assert.strictEqual(Model.displayStatus({ status: status }), status)
+})
+
+test("reblogger returns the booster only for a boost", function () {
+  const booster = { id: "9" }
+  const boost = { id: "2", account: booster, reblog: { id: "1" } }
+  assert.strictEqual(Model.reblogger(boost), booster)
+  assert.strictEqual(Model.reblogger({ id: "1" }), null)
+})
+
+test("boosted media survives statusMedia via displayStatus", function () {
+  const original = {
+    id: "1",
+    media_attachments: [{ url: "https://x/1.png", preview_url: "https://x/1.png", description: "" }],
+  }
+  const boost = { id: "2", media_attachments: [], reblog: original }
+  const media = Model.statusMedia(Model.displayStatus(boost))
+  assert.strictEqual(media.length, 1)
+  assert.strictEqual(media[0].url, "https://x/1.png")
+})
+
+test("statusCard reads the OpenGraph preview of a link-share post", function () {
+  const status = {
+    media_attachments: [],
+    card: { url: "https://example.com/a", title: "A title", image: "https://example.com/a.jpg" },
+  }
+  const card = Model.statusCard(status)
+  assert.deepStrictEqual(card, { image: "https://example.com/a.jpg", url: "https://example.com/a", title: "A title" })
+})
+
+test("statusCard is null without a usable image", function () {
+  assert.strictEqual(Model.statusCard({ card: null }), null)
+  assert.strictEqual(Model.statusCard({ card: { url: "https://example.com/a" } }), null)
+  assert.strictEqual(Model.statusCard({ card: { image: "javascript:alert(1)" } }), null)
+  assert.strictEqual(Model.statusCard({}), null)
+})
+
 // ------------------------------------------------------------- instance url
 
 test("a bare host becomes https", function () {

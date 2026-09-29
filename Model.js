@@ -354,11 +354,45 @@ function statusMedia(status) {
   return out
 }
 
+// A post that only shares a link (the common RSS-bot pattern: "Title (Site)"
+// with no upload of its own) carries no media_attachments at all. Mastodon
+// still fetches an OpenGraph preview for the linked page and exposes it as
+// status.card, with the image already cached on the instance and served as
+// an absolute URL. Only used when statusMedia() found nothing, since a real
+// attachment always takes priority over the link preview.
+function statusCard(status) {
+  var card = status && status.card
+  if (!card || typeof card !== "object") return null
+  var image = safeHttpUrl(card.image)
+  if (image === "") return null
+  return {
+    image: image,
+    url: safeHttpUrl(card.url),
+    title: String(card.title || "")
+  }
+}
+
 // Notifications wrap the status in .status, timeline entries are the status
 // itself. Both carry an id, so one accessor covers timelines and mentions.
 function entryId(entry) {
   var status = entry && entry.status ? entry.status : entry
   return status && status.id ? String(status.id) : ""
+}
+
+// A boosted post wraps the original status in .reblog; the outer status
+// itself carries no content and no media_attachments, only the booster's
+// account. displayStatus() returns the innermost status so content, media
+// and the original author are what the card actually renders; reblogger()
+// returns the account that did the boosting (or null for a plain post) so
+// the card can still say who boosted it.
+function displayStatus(entry) {
+  var status = entry && entry.status ? entry.status : entry
+  return (status && status.reblog) ? status.reblog : status
+}
+
+function reblogger(entry) {
+  var status = entry && entry.status ? entry.status : entry
+  return (status && status.reblog) ? status.account : null
 }
 
 function oldestId(list) {
@@ -454,9 +488,12 @@ if (typeof module !== "undefined") {
     statusUrl: statusUrl,
     statusRichText: statusRichText,
     statusMedia: statusMedia,
+    statusCard: statusCard,
     safeHttpUrl: safeHttpUrl,
     pagedUrl: pagedUrl,
     entryId: entryId,
+    displayStatus: displayStatus,
+    reblogger: reblogger,
     oldestId: oldestId,
     appendUnique: appendUnique,
     PAGE_SIZE: PAGE_SIZE,

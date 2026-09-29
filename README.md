@@ -34,6 +34,7 @@ from jumping around while you scroll:
 │ MASTODON              ⟳  ⏻   │  header        stays put
 ├──────────────────────────────┤
 │ [Home] [Local] [Mentions]    │  tabs          stays put
+
 ├──────────────────────────────┤
 │ What's on your mind?         │  composer      stays put
 │ [ Post ]                      │

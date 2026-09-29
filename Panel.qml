@@ -201,7 +201,10 @@ Panel {
   function loadRelationships(statuses) {
     var ids = []
     for (var i = 0; i < statuses.length; i++) {
-      var id = statuses[i].account.id
+      // The Follow button targets the original author (statusDelegate.status,
+      // which unwraps a boost's .reblog), so relationships must be looked up
+      // for that same account rather than the outer status's account.
+      var id = Model.displayStatus(statuses[i]).account.id
       if (ids.indexOf(id) === -1) ids.push(id)
     }
     if (ids.length === 0) return
@@ -638,16 +641,30 @@ Panel {
             Item {
               id: statusDelegate
               required property var modelData
+              // A boost wraps the original post in .reblog; the outer status
+              // carries no content or media_attachments of its own, so every
+              // read below goes through the unwrapped status instead of
+              // modelData directly. Without this, boosted posts rendered
+              // blank text and no images.
+              readonly property var status: Model.displayStatus(modelData)
+              readonly property var reblogger: Model.reblogger(modelData)
               // Single source of truth: the grid, the column count and the
               // alt text all read this one list. Deriving them from separate
               // statusMedia() calls let the grid end up populated while the
               // card believed it had no media, which collapsed the card to the
               // text height and let the image spill past the card and the
               // window edge.
-              readonly property var media: Model.statusMedia(modelData.status || modelData)
+              readonly property var media: Model.statusMedia(statusDelegate.status)
               readonly property int mediaCount: media.length
-              readonly property bool sensitive: (modelData.status || modelData).sensitive === true
+              // A link-share post (the common RSS-bot pattern) carries no
+              // media_attachments of its own; the only image is Mastodon's
+              // cached OpenGraph preview of the linked page, in status.card.
+              // Only looked up when there is no real attachment, since an
+              // actual upload always takes priority over the link preview.
+              readonly property var linkCard: mediaCount === 0 ? Model.statusCard(statusDelegate.status) : null
+              readonly property bool sensitive: statusDelegate.status.sensitive === true
               readonly property bool mediaVisible: mediaCount > 0 && (!sensitive || mediaRevealed)
+              readonly property bool cardVisible: linkCard !== null && (!sensitive || mediaRevealed)
               property bool mediaRevealed: false
               width: parent.width
               height: statusCard.implicitHeight
@@ -671,12 +688,29 @@ Panel {
                   anchors.bottomMargin: Style.space(6)
                   spacing: Style.space(4)
 
+                  Text {
+                    width: parent.width
+                    visible: statusDelegate.reblogger !== null
+                    // visible: false does not skip evaluating text in QML, so
+                    // this has to guard the null case itself instead of
+                    // relying on visibility — accountDisplayName(null) throws
+                    // and that broke the implicitHeight of every card below,
+                    // which is why images went missing on unrelated posts.
+                    text: statusDelegate.reblogger !== null
+                      ? ("\uf079 " + Model.accountDisplayName(statusDelegate.reblogger) + " boosted")
+                      : ""
+                    color: Qt.darker(root.contentForeground, 1.5)
+                    font.family: root.contentFontFamily
+                    font.pixelSize: Style.font.caption
+                    elide: Text.ElideRight
+                  }
+
                   Row {
                     width: parent.width
                     spacing: Style.space(6)
 
                     Text {
-                      text: Model.accountDisplayName(modelData.account || modelData.status?.account)
+                      text: Model.accountDisplayName(statusDelegate.status.account)
                       color: root.contentForeground
                       font.family: root.contentFontFamily
                       font.pixelSize: Style.font.bodySmall
@@ -686,7 +720,7 @@ Panel {
 
                     Text {
                       anchors.verticalCenter: parent.verticalCenter
-                      text: Model.accountHandle(modelData.account || modelData.status?.account)
+                      text: Model.accountHandle(statusDelegate.status.account)
                       color: Qt.darker(root.contentForeground, 1.5)
                       font.family: root.contentFontFamily
                       font.pixelSize: Style.font.caption
@@ -695,7 +729,7 @@ Panel {
 
                     Text {
                       anchors.verticalCenter: parent.verticalCenter
-                      text: Model.formatTime(modelData.created_at || modelData.status?.created_at)
+                      text: Model.formatTime(statusDelegate.status.created_at)
                       color: Qt.darker(root.contentForeground, 1.7)
                       font.family: root.contentFontFamily
                       font.pixelSize: Style.font.caption
@@ -704,13 +738,13 @@ Panel {
                     Item { width: Style.space(4) }
 
                     Button {
-                      visible: !root.isFollowing((modelData.account || modelData.status?.account)?.id)
+                      visible: !root.isFollowing(statusDelegate.status.account?.id)
                       text: "Follow"
                       bordered: true
                       focusable: true
                       foreground: root.contentForeground
                       fontFamily: root.contentFontFamily
-                      onClicked: root.toggleFollow(modelData.account || modelData.status?.account)
+                      onClicked: root.toggleFollow(statusDelegate.status.account)
                     }
                   }
 
@@ -721,7 +755,7 @@ Panel {
                     width: parent.width
                     textFormat: Text.RichText
                     text: Model.statusRichText(
-                      modelData.status || modelData,
+                      statusDelegate.status,
                       String(root.contentForeground),
                       String(Color.accent))
                     color: root.contentForeground
@@ -735,6 +769,7 @@ Panel {
 
                   Button {
                     visible: statusDelegate.sensitive && !statusDelegate.mediaRevealed
+                      && (statusDelegate.mediaCount > 0 || statusDelegate.linkCard !== null)
                     text: "Show media"
                     bordered: true
                     focusable: true
@@ -790,6 +825,39 @@ Panel {
                     }
                   }
 
+                  Rectangle {
+                    id: linkCardRect
+                    width: parent.width
+                    visible: statusDelegate.cardVisible
+                    // Explicit height, 0 when hidden: same reasoning as the
+                    // media grid above — an invisible item with no height
+                    // still reports one to the Column, which pushes every
+                    // card below it down by an empty gap.
+                    height: statusDelegate.cardVisible ? Style.space(150) : 0
+                    radius: Style.cornerRadius
+                    color: Style.controlFill(false, false, root.contentForeground, Color.accent)
+                    clip: true
+
+                    Image {
+                      anchors.fill: parent
+                      source: statusDelegate.cardVisible ? statusDelegate.linkCard.image : ""
+                      fillMode: Image.PreserveAspectCrop
+                      asynchronous: true
+                      smooth: true
+                      cache: true
+                    }
+
+                    MouseArea {
+                      anchors.fill: parent
+                      hoverEnabled: true
+                      cursorShape: Qt.PointingHandCursor
+                      onClicked: {
+                        var url = statusDelegate.linkCard ? statusDelegate.linkCard.url : ""
+                        if (url !== "") Qt.openUrlExternally(url)
+                      }
+                    }
+                  }
+
                   Text {
                     width: parent.width
                     readonly property string altText: {
@@ -816,31 +884,31 @@ Panel {
                       tooltipText: "Reply"
                       foreground: root.contentForeground
                       fontFamily: root.contentFontFamily
-                      onClicked: root.startReply(modelData.status || modelData)
+                      onClicked: root.startReply(statusDelegate.status)
                     }
 
                     PanelActionButton {
                       iconText: "\uf079"
-                      tooltipText: (modelData.status || modelData).reblogged ? "Unreblog" : "Reblog"
-                      foreground: (modelData.status || modelData).reblogged ? Color.accent : root.contentForeground
+                      tooltipText: statusDelegate.status.reblogged ? "Unreblog" : "Reblog"
+                      foreground: statusDelegate.status.reblogged ? Color.accent : root.contentForeground
                       fontFamily: root.contentFontFamily
-                      onClicked: root.toggleReblog(modelData.status || modelData)
+                      onClicked: root.toggleReblog(statusDelegate.status)
                     }
 
                     PanelActionButton {
                       iconText: "\uf004"
-                      tooltipText: (modelData.status || modelData).favourited ? "Unfavourite" : "Favourite"
-                      foreground: (modelData.status || modelData).favourited ? Color.accent : root.contentForeground
+                      tooltipText: statusDelegate.status.favourited ? "Unfavourite" : "Favourite"
+                      foreground: statusDelegate.status.favourited ? Color.accent : root.contentForeground
                       fontFamily: root.contentFontFamily
-                      onClicked: root.toggleFavourite(modelData.status || modelData)
+                      onClicked: root.toggleFavourite(statusDelegate.status)
                     }
 
                     PanelActionButton {
                       iconText: "\uf02e"
-                      tooltipText: (modelData.status || modelData).bookmarked ? "Unbookmark" : "Bookmark"
-                      foreground: (modelData.status || modelData).bookmarked ? Color.accent : root.contentForeground
+                      tooltipText: statusDelegate.status.bookmarked ? "Unbookmark" : "Bookmark"
+                      foreground: statusDelegate.status.bookmarked ? Color.accent : root.contentForeground
                       fontFamily: root.contentFontFamily
-                      onClicked: root.toggleBookmark(modelData.status || modelData)
+                      onClicked: root.toggleBookmark(statusDelegate.status)
                     }
                   }
                 }
