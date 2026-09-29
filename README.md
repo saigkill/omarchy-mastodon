@@ -2,6 +2,8 @@
 
 Mastodon client for the Omarchy Quattro bar with OAuth login, timelines and interactions.
 
+![Preview](https://github.com/saigkill/omarchy-mastodon/blob/master/preview.png?raw=true)
+
 ## Features
 
 - **Bar widget** — a Mastodon icon in the bar. Opens a panel with:
