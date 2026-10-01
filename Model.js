@@ -6,6 +6,12 @@ var APP_SCOPES = "read write follow"
 var PAGE_SIZE = 40
 var MAX_MEDIA_PER_STATUS = 4
 
+// Mastodon's own default for an attachment description is 10000 characters,
+// but like every limit it is instance configuration and an administrator can
+// lower it, so the value in use is read from the instance (see
+// parseMediaDescriptionLimit) and this is only the fallback.
+var DEFAULT_MEDIA_DESCRIPTION_LIMIT = 10000
+
 // Mastodon's own default is 500 characters per status, but the limit is
 // instance configuration and administrators do raise or lower it, so the real
 // value is read from the instance (see parseMaxCharacters) and this is only the
@@ -196,6 +202,21 @@ function parseMaxMediaAttachments(data) {
   return limit
 }
 
+// The per-attachment description limit sits next to the media limits, not with
+// the status ones, because it belongs to the attachment rather than the post.
+function parseMediaDescriptionLimit(data) {
+  if (!data || typeof data !== "object") return DEFAULT_MEDIA_DESCRIPTION_LIMIT
+  var configuration = data.configuration
+  if (!configuration || typeof configuration !== "object") return DEFAULT_MEDIA_DESCRIPTION_LIMIT
+  var attachments = configuration.media_attachments
+  if (!attachments || typeof attachments !== "object") return DEFAULT_MEDIA_DESCRIPTION_LIMIT
+  var value = Number(attachments.description_limit)
+  if (!isFinite(value)) return DEFAULT_MEDIA_DESCRIPTION_LIMIT
+  var limit = Math.floor(value)
+  if (limit < 1 || limit > 1000000) return DEFAULT_MEDIA_DESCRIPTION_LIMIT
+  return limit
+}
+
 // The composer's text, cut to what the instance will accept. The instance
 // refuses a longer status with a 422, and the panel cuts it rather than
 // letting the user build a post that cannot be sent.
@@ -244,6 +265,15 @@ function relationshipCmd(helper, id) {
 // user and a filename says what is about to be published.
 function uploadMediaCmd(helper) {
   return [helper, "upload"]
+}
+
+// The instance sets an alt text with PUT /api/v1/media/:id, and only answers
+// while the attachment is not yet part of a posted status — so the text goes
+// there the moment it is saved, rather than being collected at post time. The
+// description is not a secret and the helper joins every key=value pair on the
+// command line; the media id is the only thing in it that the instance needs.
+function describeMediaCmd(helper, mediaId, description) {
+  return [helper, "describe", String(mediaId), "description=" + String(description)]
 }
 
 // The desktop's own file chooser, not Qt's: a QtQuick.Dialogs FileDialog does
@@ -604,8 +634,10 @@ if (typeof module !== "undefined") {
     instanceConfigCmd: instanceConfigCmd,
     parseMaxCharacters: parseMaxCharacters,
     parseMaxMediaAttachments: parseMaxMediaAttachments,
+    parseMediaDescriptionLimit: parseMediaDescriptionLimit,
     limitText: limitText,
     uploadMediaCmd: uploadMediaCmd,
+    describeMediaCmd: describeMediaCmd,
     pickMediaCmd: pickMediaCmd,
     pendingMediaIds: pendingMediaIds,
     baseName: baseName,
@@ -642,6 +674,7 @@ if (typeof module !== "undefined") {
     PAGE_SIZE: PAGE_SIZE,
     MAX_MEDIA_PER_STATUS: MAX_MEDIA_PER_STATUS,
     DEFAULT_MAX_CHARACTERS: DEFAULT_MAX_CHARACTERS,
+    DEFAULT_MEDIA_DESCRIPTION_LIMIT: DEFAULT_MEDIA_DESCRIPTION_LIMIT,
     emptyAuth: emptyAuth,
     decodeAuth: decodeAuth,
     isAuthed: isAuthed,

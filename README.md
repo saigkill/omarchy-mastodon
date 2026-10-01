@@ -3,6 +3,7 @@
 Mastodon client for the Omarchy Quattro bar with OAuth login, timelines and interactions.
 
 ![Preview](https://github.com/saigkill/omarchy-mastodon/blob/master/preview.png?raw=true)
+![Preview1](https://github.com/saigkill/omarchy-mastodon/blob/master/preview1.png?raw=true)
 
 ## Features
 
@@ -14,6 +15,8 @@ Mastodon client for the Omarchy Quattro bar with OAuth login, timelines and inte
     (Omarchy's `omarchy-file-select`), you may pick several at once, and each is
     uploaded right away and shown as a thumbnail. Post it together with the text
     or on its own, and remove it again with the small ✕ on the thumbnail
+  - **Alt text per image** — click a thumbnail to describe it. The badge reads
+    `+ALT` while an image has none and `ALT` once it has one
   - **Character limit** — the counter next to the Post button shows `23/500`, and
     the field refuses a character more than the instance allows
   - **Replies** — the reply button on a status scrolls back to the composer, shows
@@ -45,7 +48,9 @@ from jumping around while you scroll:
 
 ├──────────────────────────────┤
 │ What's on your mind?         │  composer      stays put
-│ [ Post ]               23/500│
+│ [ Post ] [ Image ]     23/500│
+│ ▢ALT ▢ALT                    │  ┐ thumbnails, and the
+│ Alt text [        ] [Save]   │  ┘ alt text editor for one
 ├──────────────────────────────┤
 │  ▢ 10:24  @someone           │  ┐
 │  status text …                │  │ the feed scrolls,
@@ -122,6 +127,7 @@ See `mastodon_helper.py`'s module docstring for the full reasoning, and
 - `GET /api/v1/timelines/public?local=true` — local timeline
 - `GET /api/v1/notifications?types[]=mention` — mentions
 - `POST /api/v2/media` — upload an attached image
+- `PUT /api/v1/media/:id` — set the alt text of an attached image
 - `POST /api/v1/statuses` — post status, with `media_ids[]` for the images
 - `POST /api/v1/statuses/:id/reblog` / `unreblog` — reblog
 - `POST /api/v1/statuses/:id/favourite` / `unfavourite` — favourite
@@ -190,9 +196,38 @@ by accident. The multipart body itself is built in memory with a random
 boundary, and the file's name is folded to ASCII for the part header so that a
 quote or a newline in it cannot break the header apart.
 
-Alt text is not asked for in this version, and a post may consist of images only:
-in that case the `status` field is left out of the request entirely rather than
-sent empty, which the instance would answer with a 422.
+A post may consist of images only: in that case the `status` field is left out of
+the request entirely rather than sent empty, which the instance would answer with
+a 422.
+
+## Alt text
+
+The alt text belongs to the attachment, not to the status, so it does not travel
+in the post request. Clicking a thumbnail opens a one-line editor underneath the
+image strip; **Save** (or <kbd>Enter</kbd>) sends it, **Cancel** or
+<kbd>Esc</kbd> throws it away, and the thumbnail's badge changes from `+ALT` to
+`ALT`. A failure keeps the text in the field instead of dropping it, so nothing
+typed is lost.
+
+**Why it is sent at Save and not at Post.** The instance only answers
+`PUT /api/v1/media/:id` while the attachment is not yet part of a posted status —
+once the post exists, the answer is a 404. The panel therefore sends the text the
+moment it is confirmed, while it still can, and afterwards only remembers what
+was accepted. `describe` is a form-field request, not a file upload, so unlike
+`upload` it needs no path in the environment: it takes the media id and one
+`description=<text>` argument and splits on the *first* `=`, so a text that
+contains one survives.
+
+The media id is the only piece of that command the caller controls and it goes
+into the request path, so `cmd_describe` checks that it is all digits before
+anything is sent. `endpoint_path()` rules out a crafted endpoint pointing at
+another origin, but not a path like `/api/v1/media/../../accounts/...` climbing
+back out, so the digits are checked here. How long a description may be is
+instance configuration too (`configuration.media_attachments.description_limit`,
+10000 on Mastodon's own instances) and the field is clamped to it.
+
+Alt text is also what the feed renders underneath an image, so an image with none
+is announced as such rather than silently described as a picture.
 
 ## The scrolling composer
 
@@ -391,12 +426,39 @@ the size limit is 20 MiB, and the instance's own limit on images per status is
 read from its configuration. The `!` on the thumbnail marks the file that
 failed; remove it with ✕ and pick it again.
 
+**"Alt text not saved" under the image strip.** The instance refused the
+`PUT /api/v1/media/:id`. That endpoint only answers while the attachment is not
+yet part of a posted status, so this means the image was already posted and its
+alt text can no longer be changed — edit the post on the web instead. The typed
+text stays in the field so it can be copied over.
+
+**The panel is empty and the log says `Syntax error`.** A brace went missing or
+was left over, and Quickshell reports only the line where it noticed, not the one
+that caused it. Count the braces to find the real place:
+
+```sh
+python3 - <<'EOF'
+import re
+depth = 0
+for n, l in enumerate(open('Panel.qml', encoding='utf-8').read().split('\n'), 1):
+    s = re.sub(r'"(\\.|[^"\\])*"', '""', l)
+    s = re.sub(r'//.*', '', s)
+    for c in s:
+        depth += (c == '{') - (c == '}')
+print(depth)  # must be 0
+EOF
+```
+
 **QML errors in the log.** The plugin uses `qs.*` imports, so `qmllint` reports
 false positives. Trust the shell log instead:
 
 ```sh
 journalctl --user --since "-1m" | grep -i mastodon
 ```
+
+`qmllint` does not reliably report a syntax error here either — it can exit 255
+without printing anything at all — so a clean run proves nothing. Use the brace
+count above.
 
 **Feed overlaps the panel edges or images are missing.** Both come from the feed
 column not reporting its height, so the panel cannot clip it. The cards read
@@ -420,7 +482,8 @@ only ever sent over TLS to the instance it was issued for.
 node tests/test_model.js
 
 # mastodon_helper.py: TLS enforcement, redirect handling, state file
-# permissions/symlink safety, response size cap, image upload validation
+# permissions/symlink safety, response size cap, image upload validation,
+# alt text on the media endpoint
 python3 -m unittest discover -s tests -v
 ```
 
@@ -445,6 +508,13 @@ Patches are welcome. Two things are worth knowing before you start:
   Scratch files and test data belong in `/tmp`.
 - **Test QML in the running shell, not with `qmllint`.** The `qs.*` imports make
   `qmllint` report false positives; `journalctl --user` is the source of truth.
+  `qmllint` is not a syntax check here either — it can report nothing at all on a
+  broken file. After inserting a block into `Panel.qml`, count the braces (see
+  Troubleshooting) and then reload the plugin for real.
+- **Check the panel structure, not just the balance.** A stray `}` closes an
+  enclosing `Column` and moves everything after it out of the panel: the log shows
+  one `Syntax error` and the window opens empty. The line Quickshell names is
+  where it *noticed*, not where the extra brace is.
 - **Never reintroduce a credential into `Model.js`, `BarWidget.qml` or
   `Panel.qml`.** The access token and the client secret must stay inside
   `mastodon_helper.py`; see "Credential handling" above and run both test

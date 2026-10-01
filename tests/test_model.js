@@ -52,6 +52,7 @@ const COMMANDS = {
   "saveCmd": Model.saveCmd(HELPER),
   "logoutCmd": Model.logoutCmd(HELPER),
   "uploadMediaCmd": Model.uploadMediaCmd(HELPER),
+  "describeMediaCmd": Model.describeMediaCmd(HELPER, "22348641", "ein Bild"),
 }
 
 test("every command starts with the helper and has no shell", function () {
@@ -503,6 +504,51 @@ test("the instance decides how many images a status may carry", function () {
     Model.parseMaxMediaAttachments({ configuration: { statuses: {} } }), fallback)
   assert.strictEqual(
     Model.parseMaxMediaAttachments({ configuration: { statuses: [] } }), fallback)
+})
+
+test("an alt text is set on the attachment, not on the status", function () {
+  // PUT /api/v1/media/:id only answers while the attachment is not yet part of
+  // a status, so the panel has to send the description itself and immediately.
+  assert.deepStrictEqual(
+    Model.describeMediaCmd(HELPER, "22348641", "ein Bild"), [
+      HELPER, "describe", "22348641", "description=ein Bild"])
+  // A text with an = in it has to survive the round trip as one field; the
+  // helper splits on the first = only.
+  assert.deepStrictEqual(
+    Model.describeMediaCmd(HELPER, 22348641, "a = b"), [
+      HELPER, "describe", "22348641", "description=a = b"])
+  // Clearing an alt text again is a legitimate thing to want.
+  assert.deepStrictEqual(
+    Model.describeMediaCmd(HELPER, "1", ""), [HELPER, "describe", "1", "description="])
+  assert.deepStrictEqual(
+    Model.describeMediaCmd(HELPER, "1", "mehr\nzeilig"), [
+      HELPER, "describe", "1", "description=mehr\nzeilig"])
+})
+
+test("the instance decides how long an alt text may be", function () {
+  const instance = function (limit) {
+    return { configuration: { media_attachments: { description_limit: limit } } }
+  }
+  const fallback = Model.DEFAULT_MEDIA_DESCRIPTION_LIMIT
+  assert.strictEqual(Model.parseMediaDescriptionLimit(instance(1500)), 1500)
+  assert.strictEqual(Model.parseMediaDescriptionLimit(instance("1500")), 1500)
+  assert.strictEqual(Model.parseMediaDescriptionLimit(instance(1500.9)), 1500)
+  // Zero or negative would refuse every text, a missing one has no limit.
+  assert.strictEqual(Model.parseMediaDescriptionLimit(instance(0)), fallback)
+  assert.strictEqual(Model.parseMediaDescriptionLimit(instance(-1)), fallback)
+  assert.strictEqual(Model.parseMediaDescriptionLimit(instance(null)), fallback)
+  assert.strictEqual(Model.parseMediaDescriptionLimit(instance("many")), fallback)
+  assert.strictEqual(Model.parseMediaDescriptionLimit(null), fallback)
+  assert.strictEqual(Model.parseMediaDescriptionLimit("1500"), fallback)
+  assert.strictEqual(Model.parseMediaDescriptionLimit({}), fallback)
+  assert.strictEqual(Model.parseMediaDescriptionLimit({ configuration: {} }), fallback)
+  assert.strictEqual(
+    Model.parseMediaDescriptionLimit({ configuration: { media_attachments: [] } }), fallback)
+  // The limit belongs to the attachment, so an instance that only configures
+  // the status counts must not be mistaken for one.
+  assert.strictEqual(
+    Model.parseMediaDescriptionLimit({ configuration: { statuses: { max_characters: 500 } } }),
+    fallback)
 })
 
 test("the panel hands the path to the helper on the environment", function () {

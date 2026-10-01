@@ -495,18 +495,27 @@ def cmd_get(args):
     emit_text(api_request("GET", args[0], read_state()["auth"]))
 
 
+def parse_fields(items):
+    """Turn the panel's key=value arguments into form fields.
+
+    Split on the first "=" only, so a description that contains one survives.
+    """
+    fields = {}
+    for item in items:
+        if "=" not in item:
+            raise HelperError("bad_field", EXIT_USAGE)
+        key, value = item.split("=", 1)
+        fields[key] = value
+    return fields
+
+
 def cmd_post(args):
     if len(args) < 1:
         raise HelperError("usage: post <endpoint> [key=value ...]", EXIT_USAGE)
     # Form fields are public by construction, the only ones the panel posts are
     # a status, the media ids it was given for it and the id it replies to.
-    fields = {}
-    for item in args[1:]:
-        if "=" not in item:
-            raise HelperError("bad_field", EXIT_USAGE)
-        key, value = item.split("=", 1)
-        fields[key] = value
-    emit_text(api_request("POST", args[0], read_state()["auth"], fields))
+    emit_text(api_request(
+        "POST", args[0], read_state()["auth"], parse_fields(args[1:])))
 
 
 def cmd_upload(args):
@@ -524,6 +533,24 @@ def cmd_upload(args):
     emit_text(upload_media(path, read_state()["auth"]))
 
 
+def cmd_describe(args):
+    # An alt text is set with PUT /api/v1/media/:id, which the instance only
+    # answers while the attachment is not yet part of a status — exactly where
+    # a composer holds it. The id comes from the panel and is therefore checked
+    # here: it goes into the request path, and endpoint_path() only rules out a
+    # new origin, not a path that walks back up out of /api/v1/media/.
+    if len(args) < 2:
+        raise HelperError("usage: describe <media-id> description=<text>", EXIT_USAGE)
+    media_id = str(args[0])
+    if not media_id.isdigit():
+        raise HelperError("bad_media_id", EXIT_USAGE)
+    fields = parse_fields(args[1:])
+    if "description" not in fields:
+        raise HelperError("missing_description", EXIT_USAGE)
+    emit_text(api_request(
+        "PUT", "/api/v1/media/" + media_id, read_state()["auth"], fields))
+
+
 COMMANDS = {
     "load": cmd_load,
     "save": cmd_save,
@@ -533,6 +560,7 @@ COMMANDS = {
     "get": cmd_get,
     "post": cmd_post,
     "upload": cmd_upload,
+    "describe": cmd_describe,
 }
 
 

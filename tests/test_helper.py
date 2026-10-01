@@ -20,6 +20,7 @@ import sys
 import tempfile
 import threading
 import unittest
+import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -71,6 +72,7 @@ class Recorder:
                 # Kept as bytes: an upload body is a picture, not text, so it
                 # has to be asserted on byte for byte.
                 outer.requests.append({
+                    "method": self.command,
                     "path": self.path,
                     "headers": dict(self.headers),
                     "raw": body,
@@ -95,6 +97,14 @@ class Recorder:
                 self._reply()
 
             def do_POST(self):
+                self._read_body_and_reply()
+
+            def do_PUT(self):
+                # An alt text is sent as a PUT on the media endpoint, so the
+                # recorder has to answer it the way the instance does.
+                self._read_body_and_reply()
+
+            def _read_body_and_reply(self):
                 length = int(self.headers.get("Content-Length") or 0)
                 self._record(self.rfile.read(length))
                 if self.path == "/boom" or self.path == outer.error_path:
@@ -621,6 +631,88 @@ class UploadingImages(HelperTestCase):
         self.write_auth(instance=self.server.base, accessToken=TOKEN)
         self.server.error_path = "/api/v2/media"
         result = self.upload(self.write_image())
+        self.assertEqual(result.returncode, helper.EXIT_HTTP)
+        self.assertEqual(result.stdout, b"")
+
+
+class DescribingImages(HelperTestCase):
+    """The alt text: PUT on the attachment, and the id that goes into it.
+
+    Mastodon only answers PUT /api/v1/media/:id while the attachment is not yet
+    part of a status, so this has to be a PUT on the media endpoint rather than
+    a field on the status. The id arrives from the panel and lands in the
+    request path, which is why it is checked before anything is sent.
+    """
+
+    def test_the_description_goes_to_the_media_endpoint_with_a_put(self):
+        self.write_auth(instance=self.server.base, accessToken=TOKEN)
+        result = self.run_helper("describe", "22348641", "description=ein Bild")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        request = self.server.last
+        self.assertEqual(request["method"], "PUT")
+        self.assertEqual(request["path"], "/api/v1/media/22348641")
+        self.assertEqual(request["headers"]["Authorization"], "Bearer " + TOKEN)
+        self.assertEqual(
+            request["headers"]["Content-Type"], "application/x-www-form-urlencoded")
+        self.assertEqual(
+            urllib.parse.parse_qs(request["raw"].decode("utf-8")),
+            {"description": ["ein Bild"]})
+
+    def test_an_alt_text_with_an_equals_sign_survives(self):
+        # The panel sends one key=value argument, so the helper may only split on
+        # the first "=" — a description that contains one has to stay intact.
+        self.write_auth(instance=self.server.base, accessToken=TOKEN)
+        result = self.run_helper("describe", "1", "description=a = b")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            urllib.parse.parse_qs(self.server.last["raw"].decode("utf-8")),
+            {"description": ["a = b"]})
+
+    def test_an_alt_text_can_be_set_and_cleared_again(self):
+        self.write_auth(instance=self.server.base, accessToken=TOKEN)
+        self.assertEqual(
+            self.run_helper("describe", "1", "description=").returncode, 0)
+        # keep_blank_values, because clearing an alt text sends an empty value
+        # and parse_qs would otherwise drop the field entirely.
+        self.assertEqual(
+            urllib.parse.parse_qs(
+                self.server.last["raw"].decode("utf-8"), keep_blank_values=True),
+            {"description": [""]})
+
+    def test_a_media_id_that_is_not_a_number_never_leaves_the_machine(self):
+        # The id is the one piece of this command the caller controls, and it
+        # goes into the path. endpoint_path() rules out another origin, but not
+        # a path that climbs back out of /api/v1/media/, so the digits are
+        # checked here. Nothing may be sent in that case.
+        self.write_auth(instance=self.server.base, accessToken=TOKEN)
+        for media_id in ("../accounts/verify_credentials", "1/../../x",
+                         "22348641?x=1", "22348641#f", " ", "+1", ""):
+            result = self.run_helper("describe", media_id, "description=x")
+            self.assertEqual(result.returncode, helper.EXIT_USAGE, media_id)
+            self.assertIn(b"bad_media_id", result.stderr)
+        self.assertEqual(self.server.requests, [])
+
+    def test_a_description_is_required(self):
+        self.write_auth(instance=self.server.base, accessToken=TOKEN)
+        for args in (("1",), ("1", "focus=0,0"), ("1", "descript")):
+            result = self.run_helper("describe", *args)
+            self.assertNotEqual(result.returncode, 0, args)
+        self.assertEqual(self.server.requests, [])
+
+    def test_describing_an_image_needs_a_token(self):
+        self.write_auth(instance=self.server.base)
+        result = self.run_helper("describe", "1", "description=x")
+        self.assertEqual(result.returncode, helper.EXIT_STATE)
+        self.assertIn(b"not_authenticated", result.stderr)
+        self.assertEqual(self.server.requests, [])
+
+    def test_an_instance_refusal_is_reported(self):
+        # The instance answers 404 once the attachment is part of a status, and
+        # the panel needs that to be a non-zero exit rather than a document it
+        # would read as a saved description.
+        self.write_auth(instance=self.server.base, accessToken=TOKEN)
+        self.server.error_path = "/api/v1/media/1"
+        result = self.run_helper("describe", "1", "description=x")
         self.assertEqual(result.returncode, helper.EXIT_HTTP)
         self.assertEqual(result.stdout, b"")
 

@@ -50,9 +50,11 @@ Panel {
   property string postError: ""
 
   // Images attached to the composer. Each entry is
-  // { path, name, id, previewUrl, failed }: the file itself is uploaded to the
-  // instance the moment it is attached, and the thumbnail shown here is the
-  // preview the instance made of it, so the panel never reads a local image.
+  // { path, name, id, previewUrl, failed, description }: the file itself is
+  // uploaded to the instance the moment it is attached, and the thumbnail shown
+  // here is the preview the instance made of it, so the panel never reads a
+  // local image. description is the confirmed alt text; "" is both "none given"
+  // and "cleared again".
   property var media: []
   // Paths picked but not uploaded yet. One Quickshell.Io.Process runs one
   // command at a time, so a multi-file selection is uploaded one after the
@@ -61,8 +63,16 @@ Panel {
   property bool pickingMedia: false
   property bool uploadingMedia: false
   property string uploadingPath: ""
+  // The alt text being edited (path of the image) and the text in the field.
+  // altPath is "" when no image is being described, which also hides the editor.
+  property string altPath: ""
+  property string altDraft: ""
+  property string altError: ""
+  property bool savingAlt: false
+  property string altSavingPath: ""
+  property string altSavingText: ""
   readonly property bool busyWithMedia: root.pickingMedia || root.uploadingMedia
-    || root.mediaQueue.length > 0
+    || root.mediaQueue.length > 0 || root.savingAlt
   readonly property int mediaCount: Model.pendingMediaIds(root.media).length
   readonly property bool canPost: root.composerText.trim() !== "" || root.mediaCount > 0
 
@@ -75,6 +85,9 @@ Panel {
   // an instance that reports none) the default is used, so the composer is
   // never briefly unlimited.
   property int maxCharacters: Model.DEFAULT_MAX_CHARACTERS
+  // The limit for one image's alt text, read from the instance like the other
+  // two. It is a limit per attachment, so it does not shrink the composer text.
+  property int mediaDescriptionLimit: Model.DEFAULT_MEDIA_DESCRIPTION_LIMIT
   property bool instanceConfigLoaded: false
   readonly property int composerLength: root.composerText.length
 
@@ -145,6 +158,7 @@ Panel {
       id: "",
       previewUrl: "",
       failed: false,
+      description: "",
     }])
     uploadMediaProc.command = Model.uploadMediaCmd(root.helperScript)
     uploadMediaProc.environment = ({ MASTODON_UPLOAD_PATH: path })
@@ -172,8 +186,11 @@ Panel {
     for (var i = 0; i < root.media.length; i++) {
       var entry = root.media[i]
       if (entry.path === path) {
+        // description is carried over: the user may have typed one while the
+        // upload was still running.
         entry = { path: entry.path, name: entry.name, id: id,
-          previewUrl: previewUrl, failed: id === "" }
+          previewUrl: previewUrl, failed: id === "",
+          description: entry.description || "" }
       }
       next.push(entry)
     }
@@ -181,11 +198,77 @@ Panel {
   }
 
   function removeMedia(entry) {
+    if (root.altPath === entry.path) root.altPath = ""
     var next = []
     for (var i = 0; i < root.media.length; i++) {
       if (root.media[i].path !== entry.path) next.push(root.media[i])
     }
     root.media = next
+  }
+
+  // ------------------------------------------------------------ alt texts
+
+  // Which image is being given an alt text, and the text being typed. The alt
+  // text belongs to the attachment, and Mastodon only accepts it while that
+  // attachment is not yet part of a posted status — so it is sent with its own
+  // request the moment it is saved, and afterwards travels with the media id
+  // into the status. The panel only has to remember what was confirmed.
+  function openAltText(entry) {
+    if (root.savingAlt || entry.id === "") return
+    root.altPath = entry.path
+    root.altDraft = entry.description || ""
+    root.altError = ""
+    root.altField.text = root.altDraft
+    Qt.callLater(function () { altField.forceActiveFocus() })
+  }
+
+  function closeAltText() {
+    root.altPath = ""
+    root.altDraft = ""
+    root.altError = ""
+  }
+
+  function saveAltText() {
+    if (root.savingAlt || root.altPath === "") return
+    var target = null
+    for (var i = 0; i < root.media.length; i++) {
+      if (root.media[i].path === root.altPath) target = root.media[i]
+    }
+    if (target === null || target.id === "") { root.closeAltText(); return }
+    root.altError = ""
+    root.savingAlt = true
+    root.altSavingPath = target.path
+    root.altSavingText = root.altDraft
+    describeProc.command = Model.describeMediaCmd(
+      root.helperScript, target.id, root.altDraft)
+    describeProc.running = true
+  }
+
+  function onDescribeExited(exitCode) {
+    var path = root.altSavingPath
+    var text = root.altSavingText
+    root.savingAlt = false
+    root.altSavingPath = ""
+    root.altSavingText = ""
+    if (exitCode !== 0) {
+      // The text stays in the field so it is not lost; the instance refuses a
+      // PUT once the attachment is part of a status, and that is the case
+      // worth a word of explanation rather than a bare failure.
+      root.altError = "Alt text not saved"
+      return
+    }
+    var next = []
+    for (var i = 0; i < root.media.length; i++) {
+      var entry = root.media[i]
+      if (entry.path === path) {
+        entry = { path: entry.path, name: entry.name, id: entry.id,
+          previewUrl: entry.previewUrl, failed: entry.failed,
+          description: text }
+      }
+      next.push(entry)
+    }
+    root.media = next
+    root.closeAltText()
   }
 
   property string feedError: ""
@@ -236,6 +319,7 @@ Panel {
     if (!parsed || typeof parsed !== "object") return
     root.maxCharacters = Model.parseMaxCharacters(parsed)
     root.maxMediaAttachments = Model.parseMaxMediaAttachments(parsed)
+    root.mediaDescriptionLimit = Model.parseMediaDescriptionLimit(parsed)
     root.instanceConfigLoaded = true
   }
 
@@ -416,6 +500,7 @@ Panel {
       root.replyToId = ""
       root.replyToUser = ""
       root.media = []
+      root.closeAltText()
       root.loadTimelines()
     } else {
       // The images stay attached, so pressing Post again reuses the uploads
@@ -494,10 +579,15 @@ Panel {
     root.media = []
     root.mediaQueue = []
     root.uploadingPath = ""
+    root.closeAltText()
+    root.savingAlt = false
+    root.altSavingPath = ""
+    root.altSavingText = ""
     // The next login can be a different instance with a different limit.
     root.maxCharacters = Model.DEFAULT_MAX_CHARACTERS
     // The next login can be a different instance with a different limit.
     root.maxMediaAttachments = Model.MAX_MEDIA_PER_STATUS
+    root.mediaDescriptionLimit = Model.DEFAULT_MEDIA_DESCRIPTION_LIMIT
     root.instanceConfigLoaded = false
   }
 
@@ -837,13 +927,182 @@ Panel {
                     anchors.right: parent.right
                     size: Style.space(18)
                     fontSize: Style.font.body
-                    iconText: "\uf00d"
+                    iconText: ""
                     tooltipText: "Remove image"
                     hoverColor: Color.urgent
                     foreground: root.contentForeground
                     fontFamily: root.contentFontFamily
                     onClicked: root.removeMedia(mediaThumb.modelData)
                   }
+
+                  // The alt text is the one thing about an image a screen
+                  // reader cannot see, so the thumbnail itself carries it: the
+                  // badge says whether one is there, and clicking the thumbnail
+                  // opens the editor. No badge on a failed upload, since there
+                  // is no attachment on the instance to describe.
+                  Rectangle {
+                    anchors.bottom: parent.bottom
+                    anchors.left: parent.left
+                    anchors.margins: 1
+                    width: altBadge.implicitWidth + Style.space(4)
+                    height: altBadge.implicitHeight + Style.space(2)
+                    radius: Style.cornerRadius
+                    visible: modelData.id !== ""
+                    color: Qt.rgba(0, 0, 0, 0.55)
+
+                    Text {
+                      id: altBadge
+                      anchors.centerIn: parent
+                      text: (modelData.description || "") !== "" ? "ALT" : "+ALT"
+                      color: (modelData.description || "") !== ""
+                        ? Color.accent
+                        : root.contentForeground
+                      font.family: root.contentFontFamily
+                      font.pixelSize: Style.font.caption - 2
+                      font.capitalization: Font.AllUppercase
+                    }
+                  }
+
+                  MouseArea {
+                    anchors.fill: parent
+                    anchors.rightMargin: Style.space(18)
+                    // Under the remove button, so that button still wins.
+                    enabled: modelData.id !== "" && !root.savingAlt
+                    cursorShape: Qt.PointingHandCursor
+                    onClicked: root.openAltText(mediaThumb.modelData)
+                  }
+
+                  Rectangle {
+                    id: altRing
+                    anchors.fill: parent
+                    radius: Style.cornerRadius
+                    color: "transparent"
+                    border.width: Style.space(2)
+                    border.color: Color.accent
+                    visible: root.altPath === mediaThumb.modelData.path
+                  }
+                }
+              }
+            }
+
+            // The alt text editor. One line, for one image, opened by clicking
+            // that image's thumbnail.
+            Rectangle {
+              id: altEditor
+              width: parent.width
+              visible: root.altPath !== ""
+              height: visible ? implicitHeight : 0
+              implicitHeight: altEditorColumn.implicitHeight + Style.space(8)
+              radius: Style.cornerRadius
+              color: Style.controlFill(false, false, root.contentForeground, Color.accent)
+
+              Column {
+                id: altEditorColumn
+                anchors.left: parent.left
+                anchors.right: parent.right
+                anchors.top: parent.top
+                anchors.margins: Style.space(4)
+                spacing: Style.space(4)
+
+                Row {
+                  width: parent.width
+                  spacing: Style.space(4)
+
+                  Text {
+                    width: parent.width - altCounter.width - Style.space(4)
+                    text: "Alt text"
+                    elide: Text.ElideRight
+                    color: Qt.darker(root.contentForeground, 1.5)
+                    font.family: root.contentFontFamily
+                    font.pixelSize: Style.font.caption
+                  }
+
+                  Text {
+                    id: altCounter
+                    text: root.altDraft.length + "/" + root.mediaDescriptionLimit
+                    color: root.altDraft.length >= root.mediaDescriptionLimit
+                      ? Color.urgent
+                      : Qt.darker(root.contentForeground, 1.7)
+                    font.family: root.contentFontFamily
+                    font.pixelSize: Style.font.caption
+                  }
+                }
+
+                Row {
+                  width: parent.width
+                  spacing: Style.space(4)
+
+                  TextField {
+                    id: altField
+                    width: parent.width - altSave.width - altDiscard.width
+                      - Style.space(8)
+                    height: implicitHeight
+                    text: ""
+                    color: root.contentForeground
+                    font.family: root.contentFontFamily
+                    font.pixelSize: Style.font.body
+                    placeholderText: "Describe this image"
+                    background: Item {}
+                    padding: 0
+                    onTextChanged: {
+                      // Same clamp as the composer text: an over-long
+                      // description is refused by the instance with a 422.
+                      var limited = Model.limitText(text, root.mediaDescriptionLimit)
+                      if (limited !== text) {
+                        var cursor = cursorPosition
+                        text = limited
+                        cursorPosition = Math.min(cursor, limited.length)
+                      }
+                      root.altDraft = limited
+                    }
+                    Keys.onEscapePressed: function(event) {
+                      root.closeAltText()
+                      keyCatcher.forceActiveFocus()
+                    }
+                    Keys.onReturnPressed: function(event) {
+                      event.accepted = true
+                      root.saveAltText()
+                    }
+                    Keys.onEnterPressed: function(event) {
+                      event.accepted = true
+                      root.saveAltText()
+                    }
+                  }
+
+                  Button {
+                    id: altSave
+                    text: root.savingAlt ? "..." : "Save"
+                    bordered: true
+                    focusable: true
+                    enabled: !root.savingAlt && root.altPath !== ""
+                    foreground: root.contentForeground
+                    fontFamily: root.contentFontFamily
+                    onClicked: root.saveAltText()
+                  }
+
+                  Button {
+                    id: altDiscard
+                    text: "Cancel"
+                    bordered: true
+                    focusable: true
+                    enabled: !root.savingAlt
+                    foreground: root.contentForeground
+                    fontFamily: root.contentFontFamily
+                    onClicked: {
+                      root.closeAltText()
+                      keyCatcher.forceActiveFocus()
+                    }
+                  }
+                }
+
+                Text {
+                  width: parent.width
+                  visible: root.altError !== ""
+                  text: root.altError
+                  color: Color.urgent
+                  wrapMode: Text.WordWrap
+                  font.family: root.contentFontFamily
+                  font.pixelSize: Style.font.caption
                 }
               }
             }
@@ -1386,6 +1645,16 @@ Panel {
     }
     onExited: function(exitCode) {
       root.onUploadMediaExited(exitCode)
+    }
+  }
+
+  // Its own process, rather than a second upload channel: an alt text is a
+  // form field on an attachment, not a file, so it needs no path in the
+  // environment and nothing is read from the reply but the exit code.
+  Process {
+    id: describeProc
+    onExited: function(exitCode) {
+      root.onDescribeExited(exitCode)
     }
   }
 
