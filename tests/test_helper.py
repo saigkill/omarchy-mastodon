@@ -59,16 +59,21 @@ class Recorder:
     def __init__(self):
         self.requests = []
         self.redirect_to = ""
+        # When set to a path, a POST to it is answered with 422 instead of the
+        # usual reply. Used to make an endpoint that normally succeeds fail.
+        self.error_path = ""
         outer = self
 
         class Handler(BaseHTTPRequestHandler):
             protocol_version = "HTTP/1.1"
 
             def _record(self, body=b""):
+                # Kept as bytes: an upload body is a picture, not text, so it
+                # has to be asserted on byte for byte.
                 outer.requests.append({
                     "path": self.path,
                     "headers": dict(self.headers),
-                    "body": body.decode("utf-8"),
+                    "raw": body,
                 })
 
             def do_GET(self):
@@ -92,7 +97,7 @@ class Recorder:
             def do_POST(self):
                 length = int(self.headers.get("Content-Length") or 0)
                 self._record(self.rfile.read(length))
-                if self.path == "/boom":
+                if self.path == "/boom" or self.path == outer.error_path:
                     payload = b'{"error":"nope"}'
                     self.send_response(422)
                     self.send_header("Content-Type", "application/json")
@@ -161,13 +166,13 @@ class HelperTestCase(unittest.TestCase):
         self.addCleanup(restore_env)
         os.environ["MASTODON_AUTH_FILE"] = self.state
 
-    def run_helper(self, *args, env=None):
+    def run_helper(self, *args, env=None, timeout=None):
         environment = dict(os.environ)
         environment["SSL_CERT_FILE"] = self.server.cert
         environment.update(env or {})
         return subprocess.run(
             [sys.executable, HELPER, *args],
-            capture_output=True, env=environment)
+            capture_output=True, env=environment, timeout=timeout)
 
     def write_auth(self, **fields):
         auth = helper.empty_auth()
@@ -443,6 +448,180 @@ class RedirectsAndErrors(HelperTestCase):
         result = self.run_helper("get", "/huge")
         self.assertEqual(result.returncode, helper.EXIT_HTTP)
         self.assertIn(b"response_too_large", result.stderr)
+        self.assertEqual(result.stdout, b"")
+
+
+class UploadingImages(HelperTestCase):
+    """The upload path: what is sent, and what is refused before it is.
+
+    An upload differs from every other call in two ways that are worth a test
+    of their own: the body is a picture rather than form fields, so it has to
+    survive byte for byte, and the only path the panel passes arrives on the
+    environment, so the file has to be identified from the environment alone.
+    """
+
+    PNG = (b"\x89PNG\r\n\x1a\n" + b"\x00\x01\x02\x03" * 8
+           + b"\r\n--not-the-boundary\r\nContent-Type: image/png\r\n\r\n"
+           + b"\xff\xd8\xe0trailer")
+
+    def setUp(self):
+        super().setUp()
+        self.dir = tempfile.mkdtemp()
+
+    def write_image(self, name="picture.png", payload=PNG):
+        path = os.path.join(self.dir, name)
+        with open(path, "wb") as handle:
+            handle.write(payload)
+        return path
+
+    def upload(self, path, *args, **kwargs):
+        environment = {"MASTODON_UPLOAD_PATH": path} if path else {}
+        return self.run_helper("upload", *args, env=environment, **kwargs)
+
+    def boundary_of(self, headers):
+        content_type = headers.get("Content-Type", "")
+        self.assertTrue(
+            content_type.startswith("multipart/form-data; boundary="),
+            content_type)
+        return content_type.split("boundary=", 1)[1].encode("ascii")
+
+    def test_upload_posts_multipart_form_to_the_v2_endpoint(self):
+        # v2 rather than v1: v1 refuses anything that is not pre-processed and
+        # answers 422 for a file it has not seen before.
+        self.write_auth(instance=self.server.base, accessToken=TOKEN)
+        result = self.upload(self.write_image())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        request = self.server.last
+        self.assertEqual(request["path"], "/api/v2/media")
+        self.assertEqual(request["headers"]["Authorization"], "Bearer " + TOKEN)
+        self.assertIn("Omarchy Mastodon", request["headers"]["User-Agent"])
+        boundary = self.boundary_of(request["headers"])
+        body = request["raw"]
+        self.assertTrue(body.startswith(b"--" + boundary + b"\r\n"))
+        self.assertTrue(body.endswith(b"\r\n--" + boundary + b"--\r\n"))
+        self.assertIn(b'Content-Disposition: form-data; name="file"', body)
+        self.assertIn(b'filename="picture.png"', body)
+        self.assertIn(b"Content-Type: image/png", body)
+
+    def test_the_picture_travels_through_unmangled(self):
+        # The body is built in memory and handed to urllib as bytes, so a bug
+        # that decoded, re-encoded or truncated it would corrupt the picture.
+        # The payload contains a CRLF and something that looks like a boundary
+        # on purpose.
+        self.write_auth(instance=self.server.base, accessToken=TOKEN)
+        result = self.upload(self.write_image())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        body = self.server.last["raw"]
+        self.assertEqual(body.count(self.PNG), 1)
+        self.assertIn(b"trailer", body)
+
+    def test_a_filename_with_awkward_characters_is_folded_for_the_header(self):
+        # A quote or a newline in the part header would end it early, and a
+        # non-ASCII name would need the MIME quoting rules to survive. The
+        # extension stays, because that is what tells the instance the type.
+        self.write_auth(instance=self.server.base, accessToken=TOKEN)
+        path = self.write_image('we"ird\nüä.png')
+        result = self.upload(path)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        body = self.server.last["raw"]
+        self.assertIn(b'filename="we_ird___.png"', body)
+        self.assertEqual(body.count(b'filename="'), 1)
+        self.assertIn(b"Content-Type: image/png", body)
+
+    def test_a_symlinked_image_is_accepted(self):
+        # Photo directories are routinely symlinked, so following one is the
+        # intended behaviour rather than an attack.
+        self.write_auth(instance=self.server.base, accessToken=TOKEN)
+        real = self.write_image("real.png")
+        link = os.path.join(self.dir, "link.png")
+        os.symlink(real, link)
+        result = self.upload(link)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(b'filename="real.png"', self.server.last["raw"])
+
+    def test_the_boundary_is_not_a_constant(self):
+        # A fixed boundary could be cut the body short by a file that happens to
+        # contain it.
+        self.write_auth(instance=self.server.base, accessToken=TOKEN)
+        first = self.upload(self.write_image("one.png"))
+        self.assertEqual(first.returncode, 0, first.stderr)
+        boundary_one = self.boundary_of(self.server.last["headers"])
+        second = self.upload(self.write_image("two.png"))
+        self.assertEqual(second.returncode, 0, second.stderr)
+        boundary_two = self.boundary_of(self.server.last["headers"])
+        self.assertNotEqual(boundary_one, boundary_two)
+
+    def test_a_path_as_an_argument_is_refused(self):
+        # /proc/<pid>/cmdline is readable by every local user, so there must be
+        # no way to pass a filename there, not even by mistake.
+        self.write_auth(instance=self.server.base, accessToken=TOKEN)
+        path = self.write_image()
+        result = self.upload(path, path)
+        self.assertEqual(result.returncode, helper.EXIT_USAGE)
+        self.assertIn(b"usage: upload", result.stderr)
+        self.assertEqual(self.server.requests, [])
+
+    def test_upload_without_the_environment_variable_is_refused(self):
+        self.write_auth(instance=self.server.base, accessToken=TOKEN)
+        result = self.upload(None)
+        self.assertEqual(result.returncode, helper.EXIT_USAGE)
+        self.assertIn(b"missing_upload_path", result.stderr)
+
+    def test_a_fifo_is_refused_instead_of_blocking(self):
+        # Opening a fifo waits for a writer that never comes, so the helper
+        # would hang for as long as the panel waits for it.
+        self.write_auth(instance=self.server.base, accessToken=TOKEN)
+        fifo = os.path.join(self.dir, "pipe.png")
+        os.mkfifo(fifo)
+        result = self.upload(fifo, timeout=30)
+        self.assertEqual(result.returncode, helper.EXIT_USAGE)
+        self.assertIn(b"not_a_regular_file", result.stderr)
+
+    def test_a_directory_is_refused(self):
+        self.write_auth(instance=self.server.base, accessToken=TOKEN)
+        result = self.upload(self.dir)
+        self.assertEqual(result.returncode, helper.EXIT_USAGE)
+        self.assertIn(b"not_a_regular_file", result.stderr)
+
+    def test_an_unsupported_format_is_refused_before_it_is_sent(self):
+        # The chooser filters, but a path can also arrive from anywhere else.
+        self.write_auth(instance=self.server.base, accessToken=TOKEN)
+        result = self.upload(self.write_image("notes.txt", b"hello"))
+        self.assertEqual(result.returncode, helper.EXIT_USAGE)
+        self.assertIn(b"unsupported_image", result.stderr)
+        self.assertEqual(self.server.requests, [])
+
+    def test_an_oversized_image_is_refused_before_it_is_sent(self):
+        self.write_auth(instance=self.server.base, accessToken=TOKEN)
+        path = os.path.join(self.dir, "huge.png")
+        with open(path, "wb") as handle:
+            handle.truncate(helper.MAX_UPLOAD_BYTES + 1)
+        result = self.upload(path)
+        self.assertEqual(result.returncode, helper.EXIT_USAGE)
+        self.assertIn(b"file_too_large", result.stderr)
+        self.assertEqual(self.server.requests, [])
+
+    def test_a_missing_file_is_refused(self):
+        self.write_auth(instance=self.server.base, accessToken=TOKEN)
+        result = self.upload(os.path.join(self.dir, "gone.png"))
+        self.assertEqual(result.returncode, helper.EXIT_USAGE)
+        self.assertIn(b"unreadable_file", result.stderr)
+
+    def test_upload_needs_a_token(self):
+        self.write_auth(instance=self.server.base)
+        result = self.upload(self.write_image())
+        self.assertEqual(result.returncode, helper.EXIT_STATE)
+        self.assertIn(b"not_authenticated", result.stderr)
+        self.assertEqual(self.server.requests, [])
+
+    def test_an_upload_error_is_reported_without_a_body(self):
+        # The panel reads the media id off stdout, so a refused upload has to
+        # be a non-zero exit with an empty stdout rather than an error document
+        # it would mistake for an attachment.
+        self.write_auth(instance=self.server.base, accessToken=TOKEN)
+        self.server.error_path = "/api/v2/media"
+        result = self.upload(self.write_image())
+        self.assertEqual(result.returncode, helper.EXIT_HTTP)
         self.assertEqual(result.stdout, b"")
 
 

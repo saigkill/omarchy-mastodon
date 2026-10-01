@@ -49,6 +49,27 @@ Panel {
   property bool posting: false
   property string postError: ""
 
+  // Images attached to the composer. Each entry is
+  // { path, name, id, previewUrl, failed }: the file itself is uploaded to the
+  // instance the moment it is attached, and the thumbnail shown here is the
+  // preview the instance made of it, so the panel never reads a local image.
+  property var media: []
+  // Paths picked but not uploaded yet. One Quickshell.Io.Process runs one
+  // command at a time, so a multi-file selection is uploaded one after the
+  // other from this queue.
+  property var mediaQueue: []
+  property bool pickingMedia: false
+  property bool uploadingMedia: false
+  property string uploadingPath: ""
+  readonly property bool busyWithMedia: root.pickingMedia || root.uploadingMedia
+    || root.mediaQueue.length > 0
+  readonly property int mediaCount: Model.pendingMediaIds(root.media).length
+  readonly property bool canPost: root.composerText.trim() !== "" || root.mediaCount > 0
+
+  // How many images the instance accepts per status, read from the same
+  // instance answer as the character limit.
+  property int maxMediaAttachments: Model.MAX_MEDIA_PER_STATUS
+
   // The character limit the instance enforces, read from the instance itself
   // because 500 is only Mastodon's default. Until the answer arrives (and for
   // an instance that reports none) the default is used, so the composer is
@@ -67,6 +88,104 @@ Panel {
   function setComposerText(value) {
     root.composerText = value
     if (composerInput && composerInput.text !== value) composerInput.text = value
+  }
+
+  // ------------------------------------------------------------ images
+
+  // Opens the desktop file chooser and queues whatever comes back. The panel
+  // closes for the duration: it is an Overlay layer window, so the chooser, a
+  // normal client window, would open underneath it and the user would see
+  // nothing. This object stays alive while the window is hidden, so the text,
+  // the reply target and the images already attached all survive.
+  function attachImages() {
+    if (root.busyWithMedia || !root.authed) return
+    root.pickingMedia = true
+    root.postError = ""
+    root.close()
+    pickMediaProc.command = Model.pickMediaCmd()
+    pickMediaProc.running = true
+  }
+
+  function onPickMediaExited(exitCode) {
+    root.pickingMedia = false
+    // omarchy-file-select exits 1 when the chooser was closed without a
+    // selection and 2 when it never opened; neither is worth reporting. It
+    // prints one already-decoded path per line.
+    var lines = String(pickMediaOut.text || "").split("\n")
+    var picked = []
+    for (var i = 0; i < lines.length; i++) {
+      var path = lines[i].trim()
+      if (path === "") continue
+      if (root.media.length + root.mediaQueue.length + picked.length
+          >= root.maxMediaAttachments) {
+        root.postError = "At most " + root.maxMediaAttachments + " images per post"
+        break
+      }
+      picked.push(path)
+    }
+    // Assigned rather than pushed into: an in-place mutation of a var array
+    // does not notify, and busyWithMedia is bound to the queue's length.
+    root.mediaQueue = root.mediaQueue.concat(picked)
+    root.open()
+    root.startNextUpload()
+    Qt.callLater(root.focusComposer)
+  }
+
+  function startNextUpload() {
+    if (root.uploadingMedia || root.mediaQueue.length === 0) return
+    var path = root.mediaQueue[0]
+    root.mediaQueue = root.mediaQueue.slice(1)
+    root.uploadingPath = path
+    root.uploadingMedia = true
+    // The entry appears immediately, before the upload has a preview to show,
+    // so the composer reflects what was picked right away.
+    root.media = root.media.concat([{
+      path: path,
+      name: Model.baseName(path),
+      id: "",
+      previewUrl: "",
+      failed: false,
+    }])
+    uploadMediaProc.command = Model.uploadMediaCmd(root.helperScript)
+    uploadMediaProc.environment = ({ MASTODON_UPLOAD_PATH: path })
+    uploadMediaProc.running = true
+  }
+
+  function onUploadMediaExited(exitCode) {
+    root.uploadingMedia = false
+    var path = root.uploadingPath
+    root.uploadingPath = ""
+    var parsed = Model.parseJson(uploadMediaOut.text)
+    var id = parsed && parsed.id ? String(parsed.id) : ""
+    // The instance answers with a preview_url that is always there, while the
+    // full-size url is still null for a moment (the v2 endpoint processes the
+    // file in the background). Only http(s) is ever loaded into an Image.
+    var preview = id === "" ? ""
+      : Model.safeHttpUrl(parsed.preview_url || parsed.url)
+    if (id === "") root.postError = "Upload failed: " + Model.baseName(path)
+    root.setMediaResult(path, id, preview)
+    root.startNextUpload()
+  }
+
+  function setMediaResult(path, id, previewUrl) {
+    var next = []
+    for (var i = 0; i < root.media.length; i++) {
+      var entry = root.media[i]
+      if (entry.path === path) {
+        entry = { path: entry.path, name: entry.name, id: id,
+          previewUrl: previewUrl, failed: id === "" }
+      }
+      next.push(entry)
+    }
+    root.media = next
+  }
+
+  function removeMedia(entry) {
+    var next = []
+    for (var i = 0; i < root.media.length; i++) {
+      if (root.media[i].path !== entry.path) next.push(root.media[i])
+    }
+    root.media = next
   }
 
   property string feedError: ""
@@ -116,6 +235,7 @@ Panel {
     var parsed = Model.parseJson(instanceConfigOut.text)
     if (!parsed || typeof parsed !== "object") return
     root.maxCharacters = Model.parseMaxCharacters(parsed)
+    root.maxMediaAttachments = Model.parseMaxMediaAttachments(parsed)
     root.instanceConfigLoaded = true
   }
 
@@ -274,11 +394,16 @@ Panel {
 
   function postStatus() {
     var text = root.composerText.trim()
-    if (text === "" || root.posting) return
+    var ids = Model.pendingMediaIds(root.media)
+    // A post with neither text nor an accepted image is not a post: the
+    // instance answers 422 for it. Waiting for pending uploads keeps a half
+    // attached image from being left behind on the instance.
+    if (root.posting || root.busyWithMedia) return
+    if (text === "" && ids.length === 0) return
     root.posting = true
     root.postError = ""
     var cmd = Model.postStatusCmd(root.helperScript, text, root.replyToId || null,
-      root.maxCharacters)
+      root.maxCharacters, ids)
     postProc.command = cmd
     postProc.running = true
   }
@@ -290,8 +415,11 @@ Panel {
       root.setComposerText("")
       root.replyToId = ""
       root.replyToUser = ""
+      root.media = []
       root.loadTimelines()
     } else {
+      // The images stay attached, so pressing Post again reuses the uploads
+      // instead of sending them a second time.
       root.postError = "Failed to post"
     }
   }
@@ -363,8 +491,13 @@ Panel {
     root.setComposerText("")
     root.replyToId = ""
     root.replyToUser = ""
+    root.media = []
+    root.mediaQueue = []
+    root.uploadingPath = ""
     // The next login can be a different instance with a different limit.
     root.maxCharacters = Model.DEFAULT_MAX_CHARACTERS
+    // The next login can be a different instance with a different limit.
+    root.maxMediaAttachments = Model.MAX_MEDIA_PER_STATUS
     root.instanceConfigLoaded = false
   }
 
@@ -653,6 +786,68 @@ Panel {
               }
             }
 
+            // The attached images, shown with the preview the instance made of
+            // them. An upload that failed keeps its slot and shows a warning
+            // instead of vanishing, so it is obvious which file has to be
+            // picked again; it carries no id, so it is left out of the post.
+            Flow {
+              width: parent.width
+              visible: root.media.length > 0
+              // Explicit height, 0 when hidden: an invisible item still
+              // reports an implicitHeight to the Column, which would leave an
+              // empty gap above the buttons.
+              height: visible ? implicitHeight : 0
+              spacing: Style.space(6)
+
+              Repeater {
+                model: root.media
+
+                Rectangle {
+                  id: mediaThumb
+                  required property var modelData
+                  width: Style.space(56)
+                  height: Style.space(56)
+                  radius: Style.cornerRadius
+                  color: Style.controlFill(false, false, root.contentForeground, Color.accent)
+                  clip: true
+
+                  Image {
+                    anchors.fill: parent
+                    visible: modelData.previewUrl !== ""
+                    source: modelData.previewUrl
+                    fillMode: Image.PreserveAspectCrop
+                    asynchronous: true
+                    smooth: true
+                    cache: true
+                  }
+
+                  Text {
+                    anchors.centerIn: parent
+                    visible: modelData.previewUrl === ""
+                    text: "!"
+                    color: Color.urgent
+                    font.family: root.contentFontFamily
+                    font.pixelSize: Style.font.body
+                  }
+
+                  // Sized down from the default 22 so that it does not cover a
+                  // third of the thumbnail it sits on.
+                  PanelActionButton {
+                    anchors.top: parent.top
+                    anchors.right: parent.right
+                    size: Style.space(18)
+                    fontSize: Style.font.body
+                    iconText: "\uf00d"
+                    tooltipText: "Remove image"
+                    hoverColor: Color.urgent
+                    foreground: root.contentForeground
+                    fontFamily: root.contentFontFamily
+                    onClicked: root.removeMedia(mediaThumb.modelData)
+                  }
+                }
+              }
+            }
+
             // Buttons from the left, the counter against the right edge. A Row
             // cannot do this on its own: the free space in a Row is only known
             // after the last child has been placed, so the counter would have
@@ -672,10 +867,20 @@ Panel {
                   text: root.posting ? "Posting..." : "Post"
                   bordered: true
                   focusable: true
-                  enabled: !root.posting && root.composerText.trim() !== ""
+                  enabled: !root.posting && !root.busyWithMedia && root.canPost
                   foreground: root.contentForeground
                   fontFamily: root.contentFontFamily
                   onClicked: root.postStatus()
+                }
+
+                Button {
+                  text: root.busyWithMedia ? "Adding..." : "Image"
+                  bordered: true
+                  focusable: true
+                  enabled: !root.busyWithMedia
+                  foreground: root.contentForeground
+                  fontFamily: root.contentFontFamily
+                  onClicked: root.attachImages()
                 }
 
                 Button {
@@ -1159,6 +1364,28 @@ Panel {
     }
     onExited: function(exitCode) {
       root.onRelExited(exitCode)
+    }
+  }
+
+  Process {
+    id: pickMediaProc
+    stdout: StdioCollector {
+      id: pickMediaOut
+      waitForEnd: true
+    }
+    onExited: function(exitCode) {
+      root.onPickMediaExited(exitCode)
+    }
+  }
+
+  Process {
+    id: uploadMediaProc
+    stdout: StdioCollector {
+      id: uploadMediaOut
+      waitForEnd: true
+    }
+    onExited: function(exitCode) {
+      root.onUploadMediaExited(exitCode)
     }
   }
 

@@ -51,6 +51,7 @@ const COMMANDS = {
   "loadCmd": Model.loadCmd(HELPER),
   "saveCmd": Model.saveCmd(HELPER),
   "logoutCmd": Model.logoutCmd(HELPER),
+  "uploadMediaCmd": Model.uploadMediaCmd(HELPER),
 }
 
 test("every command starts with the helper and has no shell", function () {
@@ -378,6 +379,142 @@ test("authed needs an instance and a token", function () {
   assert.strictEqual(Model.isAuthed({ instance: "https://a.example", hasToken: true }), true)
   // A truthy string must not count, the helper is what decides.
   assert.strictEqual(Model.isAuthed({ instance: "https://a.example", hasToken: "yes" }), false)
+})
+
+// ------------------------------------------------------------------ images
+
+test("the chooser is Omarchy's, and it asks for several images", function () {
+  const cmd = Model.pickMediaCmd()
+  assert.strictEqual(cmd[0], "omarchy-file-select")
+  assert.ok(cmd.indexOf("--multiple") !== -1,
+    "picking more than one image at a time is the point of --multiple")
+  assert.strictEqual(cmd[cmd.length - 2], "--extensions")
+  // The filter has to name every format the helper accepts, or the chooser
+  // hides a file the user can perfectly well post.
+  for (const extension of ["jpg", "jpeg", "png", "gif", "webp"]) {
+    assert.ok(cmd[cmd.length - 1].split(" ").indexOf(extension) !== -1,
+      "the chooser filter misses " + extension)
+  }
+})
+
+test("the upload command is the subcommand and nothing else", function () {
+  // The path is the one thing that must never appear on a command line: it is
+  // readable by every local user through /proc/<pid>/cmdline and it names what
+  // is about to be published. It travels in MASTODON_UPLOAD_PATH instead.
+  assert.deepStrictEqual(Model.uploadMediaCmd(HELPER), [HELPER, "upload"])
+})
+
+test("only media the instance accepted belongs in a post", function () {
+  assert.deepStrictEqual(Model.pendingMediaIds([]), [])
+  assert.deepStrictEqual(Model.pendingMediaIds(null), [])
+  assert.deepStrictEqual(Model.pendingMediaIds(undefined), [])
+  // An upload that failed has no id, so it must not be sent as an empty one.
+  assert.deepStrictEqual(
+    Model.pendingMediaIds([{ id: "111" }, { id: "" }, { id: null }, {}, { id: "222" }]),
+    ["111", "222"])
+  // An id the JSON parser turned into a number still has to be posted as text.
+  assert.deepStrictEqual(Model.pendingMediaIds([{ id: 111 }]), ["111"])
+  // QML hands arrays to functions as QVariantList, for which isArray is false,
+  // so the length is what the list is recognised by.
+  const variantList = { length: 2, 0: { id: "111" }, 1: { id: "222" } }
+  assert.deepStrictEqual(Model.pendingMediaIds(variantList), ["111", "222"])
+  // Already extracted ids have to survive this function as well, so that
+  // handing its result on does not drop them.
+  assert.deepStrictEqual(Model.pendingMediaIds(["111", "222"]), ["111", "222"])
+  assert.deepStrictEqual(Model.pendingMediaIds(["111", "", "222"]), ["111", "222"])
+})
+
+test("a path is shortened to its name", function () {
+  assert.strictEqual(Model.baseName("/home/sascha/Pictures/hof.png"), "hof.png")
+  assert.strictEqual(Model.baseName("hof.png"), "hof.png")
+  assert.strictEqual(Model.baseName("/trailing/slash/"), "")
+  assert.strictEqual(Model.baseName(""), "")
+  assert.strictEqual(Model.baseName(null), "")
+})
+
+test("a post carries the media ids it was given", function () {
+  const cmd = Model.postStatusCmd(HELPER, "hello world", null, 500, [
+    { id: "111" }, { id: "" }, { id: "222" },
+  ])
+  assert.deepStrictEqual(cmd, [
+    HELPER, "post", "/api/v1/statuses", "status=hello world",
+    "media_ids[]=111", "media_ids[]=222",
+  ])
+  const reply = Model.postStatusCmd(HELPER, "hi", "110000000000000002", 500, [
+    { id: "111" },
+  ])
+  assert.strictEqual(reply[4], "in_reply_to_id=110000000000000002")
+  assert.strictEqual(reply[5], "media_ids[]=111")
+})
+
+test("a post keeps media ids that were already extracted", function () {
+  // The panel runs pendingMediaIds over its attachments and hands the result
+  // in, so postStatusCmd is given bare ids rather than entries. Reading `.id`
+  // off a string yields undefined and dropped every image from the post while
+  // the text went out normally — the regression this pins down.
+  const media = [{ id: "111" }, { id: "" }, { id: "222" }]
+  const ids = Model.pendingMediaIds(media)
+  assert.deepStrictEqual(ids, ["111", "222"])
+  assert.deepStrictEqual(Model.postStatusCmd(HELPER, "hi", null, 500, ids), [
+    HELPER, "post", "/api/v1/statuses", "status=hi",
+    "media_ids[]=111", "media_ids[]=222",
+  ])
+  // The same list as QML would hand it over.
+  const variantList = { length: 1, 0: { id: "111" } }
+  assert.deepStrictEqual(
+    Model.postStatusCmd(HELPER, "hi", null, 500, variantList),
+    [HELPER, "post", "/api/v1/statuses", "status=hi", "media_ids[]=111"])
+})
+
+test("a picture can be posted without a word of text", function () {
+  // Mastodon accepts a media-only status, but not one that sends an empty
+  // status field together with the images, so the field has to be left out.
+  const cmd = Model.postStatusCmd(HELPER, "", null, 500, [{ id: "111" }])
+  assert.deepStrictEqual(cmd, [
+    HELPER, "post", "/api/v1/statuses", "media_ids[]=111",
+  ])
+  // The panel trims the composer's text before it gets here, so an empty field
+  // arrives as an empty string and never as whitespace.
+  assert.ok(Model.postStatusCmd(HELPER, "", null, 500, []).length === 3,
+    "a status with neither text nor media is refused by the instance")
+})
+
+test("the instance decides how many images a status may carry", function () {
+  const instance = function (max) {
+    return { configuration: { statuses: { max_media_attachments: max } } }
+  }
+  const fallback = Model.MAX_MEDIA_PER_STATUS
+  assert.strictEqual(Model.parseMaxMediaAttachments(instance(4)), 4)
+  assert.strictEqual(Model.parseMaxMediaAttachments(instance(1)), 1)
+  assert.strictEqual(Model.parseMaxMediaAttachments(instance("2")), 2)
+  assert.strictEqual(Model.parseMaxMediaAttachments(instance(2.9)), 2)
+  // More than the panel shows would only produce an instance that refuses the
+  // post, so it falls back rather than pretending it can.
+  assert.strictEqual(Model.parseMaxMediaAttachments(instance(16)), fallback)
+  assert.strictEqual(Model.parseMaxMediaAttachments(instance(0)), fallback)
+  assert.strictEqual(Model.parseMaxMediaAttachments(instance(-5)), fallback)
+  assert.strictEqual(Model.parseMaxMediaAttachments(instance(null)), fallback)
+  assert.strictEqual(Model.parseMaxMediaAttachments(instance("many")), fallback)
+  assert.strictEqual(Model.parseMaxMediaAttachments(null), fallback)
+  assert.strictEqual(Model.parseMaxMediaAttachments("4"), fallback)
+  assert.strictEqual(Model.parseMaxMediaAttachments({}), fallback)
+  assert.strictEqual(Model.parseMaxMediaAttachments({ configuration: {} }), fallback)
+  assert.strictEqual(
+    Model.parseMaxMediaAttachments({ configuration: { statuses: {} } }), fallback)
+  assert.strictEqual(
+    Model.parseMaxMediaAttachments({ configuration: { statuses: [] } }), fallback)
+})
+
+test("the panel hands the path to the helper on the environment", function () {
+  const panel = fs.readFileSync(path.join(__dirname, "..", "Panel.qml"), "utf8")
+  assert.ok(/uploadMediaProc\.environment\s*=\s*\(\{\s*MASTODON_UPLOAD_PATH:/.test(panel),
+    "the upload path has to travel in the process environment")
+  // The command itself must stay the bare subcommand, so there is no path left
+  // to leak into /proc/<pid>/cmdline.
+  assert.ok(/uploadMediaProc\.command\s*=\s*Model\.uploadMediaCmd\(root\.helperScript\)/.test(panel),
+    "the upload command must not be built with the path in it")
+  assert.ok(!/uploadMediaCmd\s*\(\s*root\.helperScript\s*,/.test(panel),
+    "uploadMediaCmd must not take a path argument")
 })
 
 // --------------------------------------------------------- source inspection

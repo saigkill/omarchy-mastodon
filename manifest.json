@@ -2,10 +2,10 @@
   "schemaVersion": 1,
   "id": "saigkill.mastodon",
   "name": "Mastodon client",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "author": "Sascha Manns",
   "license": "MIT",
-  "description": "Mastodon client with OAuth login, Home/Local/Mentions timelines, posting and interactions",
+  "description": "Mastodon client with OAuth login, Home/Local/Mentions timelines, posting with image attachments and interactions",
   "kinds": [
     "bar-widget"
   ],
@@ -14,7 +14,7 @@
   },
   "barWidget": {
     "displayName": "Mastodon client",
-    "description": "Mastodon icon in the bar. Opens a panel with OAuth login, timelines (Home, Local, Mentions), a composer and post interactions.",
+    "description": "Mastodon icon in the bar. Opens a panel with OAuth login, timelines (Home, Local, Mentions), a composer that can attach images, and post interactions.",
     "category": "Internet",
     "allowMultiple": false,
     "defaultSection": "right"

@@ -15,6 +15,11 @@ The two secrets that cannot be read from the file yet, the authorization code
 and the instance chosen during login, arrive through the environment, because
 /proc/<pid>/environ is mode 0400 and stays readable by the owner alone.
 
+The path of a local image to be attached travels the same way. It is not a
+credential, but a filename says what the user is about to publish and
+/proc/<pid>/cmdline is world-readable, so it is passed in MASTODON_UPLOAD_PATH
+rather than as an argument.
+
 The instance is also taken from the state file rather than from the caller, so
 a token can only ever be sent to the server it was issued for.
 """
@@ -22,6 +27,7 @@ a token can only ever be sent to the server it was issued for.
 import ipaddress
 import json
 import os
+import stat
 import sys
 import urllib.error
 import urllib.parse
@@ -39,6 +45,21 @@ TIMEOUT = 30
 # compromised instance to use an oversized response to exhaust the helper's
 # memory (and, downstream, the QML StdioCollector that buffers its stdout).
 MAX_RESPONSE_BYTES = 10 * 1024 * 1024
+
+# The body of an upload is built in memory, so the file size is bounded here.
+# Mastodon's own default is 16 MiB per image, so this serves every stock
+# instance and refuses the rest before a few hundred megabytes were read.
+MAX_UPLOAD_BYTES = 20 * 1024 * 1024
+
+# The image formats the chooser offers. Anything else is refused before it is
+# sent, since the instance would only answer 422 for it.
+IMAGE_CONTENT_TYPES = {
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".png": "image/png",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
+}
 
 # The only keys the panel is allowed to write. clientSecret and accessToken are
 # owned by this script so that a compromised or buggy panel cannot overwrite a
@@ -225,6 +246,25 @@ class SameOriginRedirect(urllib.request.HTTPRedirectHandler):
 # ------------------------------------------------------------------ request
 
 
+def send_request(request):
+    """Send a prepared request and return the body as text.
+
+    curl used to run with -f, which also suppressed the body and returned a
+    non-zero status, so the panel already treats a failed page as unparsable
+    output. Keeping that contract avoids the panel mistaking a transient error
+    for an empty timeline and clearing the hasMore flag.
+    """
+    opener = urllib.request.build_opener(SameOriginRedirect)
+    try:
+        with opener.open(request, timeout=TIMEOUT) as response:
+            payload = read_capped(response)
+    except urllib.error.HTTPError as error:
+        raise HelperError("http_%d" % error.code, EXIT_HTTP) from None
+    except (urllib.error.URLError, OSError):
+        raise HelperError("network_error", EXIT_NETWORK) from None
+    return payload.decode("utf-8", "replace")
+
+
 def api_request(method, endpoint, auth, fields=None):
     token = auth.get("accessToken") or ""
     if not token:
@@ -242,19 +282,7 @@ def api_request(method, endpoint, auth, fields=None):
         headers["Content-Type"] = "application/x-www-form-urlencoded"
 
     request = urllib.request.Request(url, data=body, headers=headers, method=method)
-    opener = urllib.request.build_opener(SameOriginRedirect)
-    try:
-        with opener.open(request, timeout=TIMEOUT) as response:
-            payload = read_capped(response)
-    except urllib.error.HTTPError as error:
-        # curl ran with -f, which also suppressed the body and returned a
-        # non-zero status, so the panel already treats a failed page as
-        # unparsable output. Keeping that contract avoids the panel mistaking a
-        # transient error for an empty timeline and clearing the hasMore flag.
-        raise HelperError("http_%d" % error.code, EXIT_HTTP) from None
-    except (urllib.error.URLError, OSError):
-        raise HelperError("network_error", EXIT_NETWORK) from None
-    return payload.decode("utf-8", "replace")
+    return send_request(request)
 
 
 def anonymous_post(endpoint, fields, auth):
@@ -270,15 +298,93 @@ def anonymous_post(endpoint, fields, auth):
             "Content-Type": "application/x-www-form-urlencoded",
         },
     )
-    opener = urllib.request.build_opener(SameOriginRedirect)
+    return json.loads(send_request(request))
+
+
+# ------------------------------------------------------------------- upload
+
+
+def read_local_image(raw_path):
+    """Read a local image, refusing anything that is not a plain file.
+
+    Only a regular file is accepted, and stat() decides that before the file is
+    opened: opening a fifo blocks until a writer shows up, and a device node is
+    not an image anybody can post. The size is bounded because the multipart
+    body is assembled in memory, and the bytes that were actually read are
+    measured as well, which also catches a file that grew between the two.
+
+    Returns the payload, the file's base name and its content type.
+    """
+    path = os.path.realpath(os.path.expanduser(str(raw_path or "")))
     try:
-        with opener.open(request, timeout=TIMEOUT) as response:
-            payload = read_capped(response)
-    except urllib.error.HTTPError as error:
-        raise HelperError("http_%d" % error.code, EXIT_HTTP) from None
-    except (urllib.error.URLError, OSError):
-        raise HelperError("network_error", EXIT_NETWORK) from None
-    return json.loads(payload.decode("utf-8", "replace"))
+        info = os.stat(path)
+    except OSError:
+        raise HelperError("unreadable_file", EXIT_USAGE) from None
+    if not stat.S_ISREG(info.st_mode):
+        raise HelperError("not_a_regular_file", EXIT_USAGE)
+    try:
+        with open(path, "rb") as handle:
+            payload = handle.read(MAX_UPLOAD_BYTES + 1)
+    except OSError:
+        raise HelperError("unreadable_file", EXIT_USAGE) from None
+    if len(payload) > MAX_UPLOAD_BYTES:
+        raise HelperError("file_too_large", EXIT_USAGE)
+
+    name = os.path.basename(path)
+    suffix = os.path.splitext(name)[1].lower()
+    if suffix not in IMAGE_CONTENT_TYPES:
+        raise HelperError("unsupported_image", EXIT_USAGE)
+    return payload, name, IMAGE_CONTENT_TYPES[suffix]
+
+
+# The boundary is random rather than a fixed string, so that a file whose own
+# bytes happen to contain it cannot cut the body short inside itself.
+def multipart_body(boundary, filename, content_type, payload):
+    head = b"".join([
+        b"--", boundary, b"\r\n",
+        b'Content-Disposition: form-data; name="file"; filename="',
+        filename, b'"\r\n',
+        b"Content-Type: ", content_type.encode("ascii"), b"\r\n\r\n",
+    ])
+    return head + payload + b"\r\n--" + boundary + b"--\r\n"
+
+
+# The name is written into the part's header line as bytes, so it is folded to
+# ASCII: a quote or a control character would break the header apart, and a
+# non-ASCII one would need the quoting rules of the MIME spec to survive. The
+# extension is left alone, since that is what the instance reads to decide
+# what kind of file this is.
+def header_safe_filename(name):
+    cleaned = "".join(
+        char if char.isascii() and (char.isalnum() or char in "._-") else "_"
+        for char in name)
+    return cleaned[:80].encode("ascii") or b"image"
+
+
+# An image is uploaded before the status exists: /api/v2/media hands back the
+# media id that the status then carries in media_ids[]. The v2 endpoint answers
+# 202 and leaves "url" null while the full-size file is still being processed,
+# but "id" and "preview_url" are there right away, which is all the composer
+# needs to show a thumbnail.
+def upload_media(raw_path, auth):
+    token = auth.get("accessToken") or ""
+    if not token:
+        raise HelperError("not_authenticated", EXIT_STATE)
+    payload, name, content_type = read_local_image(raw_path)
+    boundary = b"----omarchy-mastodon-" + os.urandom(16).hex().encode("ascii")
+    request = urllib.request.Request(
+        secure_base(auth.get("instance")) + endpoint_path("/api/v2/media"),
+        data=multipart_body(boundary, header_safe_filename(name), content_type, payload),
+        method="POST",
+        headers={
+            "Accept": "application/json",
+            "User-Agent": APP_NAME,
+            "Authorization": "Bearer " + token,
+            "Content-Type": "multipart/form-data; boundary="
+            + boundary.decode("ascii"),
+        },
+    )
+    return send_request(request)
 
 
 def emit(data):
@@ -393,7 +499,7 @@ def cmd_post(args):
     if len(args) < 1:
         raise HelperError("usage: post <endpoint> [key=value ...]", EXIT_USAGE)
     # Form fields are public by construction, the only ones the panel posts are
-    # a status and the id it replies to.
+    # a status, the media ids it was given for it and the id it replies to.
     fields = {}
     for item in args[1:]:
         if "=" not in item:
@@ -401,6 +507,21 @@ def cmd_post(args):
         key, value = item.split("=", 1)
         fields[key] = value
     emit_text(api_request("POST", args[0], read_state()["auth"], fields))
+
+
+def cmd_upload(args):
+    # The subcommand takes no argument at all, so that there is no way for a
+    # caller to hand a path to the helper on the command line by accident: the
+    # only channel is the environment, which /proc/<pid>/cmdline does not show.
+    if args:
+        raise HelperError("usage: upload", EXIT_USAGE)
+    path = os.environ.get("MASTODON_UPLOAD_PATH", "")
+    if not path:
+        raise HelperError("missing_upload_path", EXIT_USAGE)
+    # The attachment the instance answered with is public: it holds the media
+    # id the panel posts, not a credential, so it travels back like any other
+    # API reply.
+    emit_text(upload_media(path, read_state()["auth"]))
 
 
 COMMANDS = {
@@ -411,6 +532,7 @@ COMMANDS = {
     "exchange": cmd_exchange,
     "get": cmd_get,
     "post": cmd_post,
+    "upload": cmd_upload,
 }
 
 

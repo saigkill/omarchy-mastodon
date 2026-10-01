@@ -10,6 +10,10 @@ Mastodon client for the Omarchy Quattro bar with OAuth login, timelines and inte
   - **OAuth login** — enter your instance, authorize in the browser, and the token is saved permanently
   - **Three tabs** — Home, Local, Mentions
   - **Composer** — single composer box, available in every tab
+  - **Attaching images** — the "Image" button opens the desktop file chooser
+    (Omarchy's `omarchy-file-select`), you may pick several at once, and each is
+    uploaded right away and shown as a thumbnail. Post it together with the text
+    or on its own, and remove it again with the small ✕ on the thumbnail
   - **Character limit** — the counter next to the Post button shows `23/500`, and
     the field refuses a character more than the instance allows
   - **Replies** — the reply button on a status scrolls back to the composer, shows
@@ -113,11 +117,12 @@ See `mastodon_helper.py`'s module docstring for the full reasoning, and
 - `POST /api/v1/apps` — register OAuth app
 - `POST /oauth/token` — exchange code for token
 - `GET /api/v1/accounts/verify_credentials` — current user
-- `GET /api/v2/instance` — the instance's own character limit
+- `GET /api/v2/instance` — the instance's own character and image limits
 - `GET /api/v1/timelines/home` — home timeline
 - `GET /api/v1/timelines/public?local=true` — local timeline
 - `GET /api/v1/notifications?types[]=mention` — mentions
-- `POST /api/v1/statuses` — post status
+- `POST /api/v2/media` — upload an attached image
+- `POST /api/v1/statuses` — post status, with `media_ids[]` for the images
 - `POST /api/v1/statuses/:id/reblog` / `unreblog` — reblog
 - `POST /api/v1/statuses/:id/favourite` / `unfavourite` — favourite
 - `POST /api/v1/statuses/:id/bookmark` / `unbookmark` — bookmark
@@ -144,6 +149,50 @@ has one, and the composer has to wrap — and an imperative write to a bound
 `text` property would drop the binding for good, which is why the field is
 synced through `setComposerText()` instead of `text: composerText`.) The status
 is cut once more in `postStatusCmd()`, the one place every post passes through.
+
+## Attaching images
+
+The **Image** button next to Post opens the desktop file chooser, several files
+can be picked at once, and each one is uploaded to the instance immediately.
+The instance hands back a media id, and the status then carries that id in
+`media_ids[]` — which is why an image is uploaded *before* the status exists and
+why the Post button stays disabled until every upload has come back.
+
+**The chooser is Omarchy's, not Qt's.** `omarchy-file-select` goes through the
+XDG portal, so what opens is an ordinary desktop window. A
+`QtQuick.Dialogs.FileDialog` does not open at all inside Quickshell, and the
+panel would in any case be in the way: it lives in the Overlay layer, so a
+normal client window opens *underneath* it. The panel therefore closes itself
+while the chooser is up and opens again afterwards. The panel object stays alive
+while its window is hidden, so the text, the reply target and the images already
+attached all survive the round trip.
+
+Because only one `Quickshell.Io.Process` runs one command at a time, a
+multi-file selection is uploaded one after the other from a queue. A file whose
+upload failed keeps its slot and shows a warning instead of silently vanishing,
+and carries no id, so it is left out of the post; pressing Post again reuses the
+uploads rather than sending them a second time.
+
+**What is refused before anything is sent.** `mastodon_helper.py` only accepts a
+regular file — `stat()` decides that *before* the file is opened, so opening a
+fifo cannot block the panel waiting for a writer that never comes — plus one of
+the formats the chooser offers (`.jpg`, `.jpeg`, `.png`, `.gif`, `.webp`) and a
+size of at most 20 MiB, which is above Mastodon's own 16 MiB default. How many
+images a status may carry comes from the instance
+(`configuration.statuses.max_media_attachments`), capped at the four the panel
+shows.
+
+**The path stays out of the command line.** `/proc/<pid>/cmdline` is world
+readable and a filename says what is about to be published, so the path travels
+in `MASTODON_UPLOAD_PATH` on the process environment instead. `mastodon_helper.py
+upload` takes no argument at all, which makes it impossible to pass a path there
+by accident. The multipart body itself is built in memory with a random
+boundary, and the file's name is folded to ASCII for the part header so that a
+quote or a newline in it cannot break the header apart.
+
+Alt text is not asked for in this version, and a post may consist of images only:
+in that case the `status` field is left out of the request entirely rather than
+sent empty, which the instance would answer with a 422.
 
 ## The scrolling composer
 
@@ -326,6 +375,22 @@ omarchy plugin list | grep saigkill.mastodon
 journalctl --user -n 100 | grep -i mastodon
 ```
 
+**The Image button does nothing, or the chooser stays hidden.** The chooser is
+`omarchy-file-select`, which needs the XDG portal; if it is missing the button
+reports nothing useful. Check that it is installed and that the panel closes and
+comes back:
+
+```sh
+omarchy-file-select --title "Test"   # should open a normal window
+journalctl --user --since "-1m" | grep -i mastodon
+```
+
+**"Upload failed: ..." under the composer.** The file was refused before or
+during the upload. The formats are `.jpg`, `.jpeg`, `.png`, `.gif` and `.webp`,
+the size limit is 20 MiB, and the instance's own limit on images per status is
+read from its configuration. The `!` on the thumbnail marks the file that
+failed; remove it with ✕ and pick it again.
+
 **QML errors in the log.** The plugin uses `qs.*` imports, so `qmllint` reports
 false positives. Trust the shell log instead:
 
@@ -355,7 +420,7 @@ only ever sent over TLS to the instance it was issued for.
 node tests/test_model.js
 
 # mastodon_helper.py: TLS enforcement, redirect handling, state file
-# permissions/symlink safety, response size cap
+# permissions/symlink safety, response size cap, image upload validation
 python3 -m unittest discover -s tests -v
 ```
 

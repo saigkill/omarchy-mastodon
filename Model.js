@@ -179,6 +179,23 @@ function parseMaxCharacters(data) {
   return limit
 }
 
+// The same instance answer decides how many images one status may carry. An
+// instance that reports nothing falls back to Mastodon's own default of four,
+// which is also the number the feed renderer shows, so attaching more than the
+// panel can display is refused up front rather than as a 422 on Post.
+function parseMaxMediaAttachments(data) {
+  if (!data || typeof data !== "object") return MAX_MEDIA_PER_STATUS
+  var configuration = data.configuration
+  if (!configuration || typeof configuration !== "object") return MAX_MEDIA_PER_STATUS
+  var statuses = configuration.statuses
+  if (!statuses || typeof statuses !== "object") return MAX_MEDIA_PER_STATUS
+  var value = Number(statuses.max_media_attachments)
+  if (!isFinite(value)) return MAX_MEDIA_PER_STATUS
+  var limit = Math.floor(value)
+  if (limit < 1 || limit > MAX_MEDIA_PER_STATUS) return MAX_MEDIA_PER_STATUS
+  return limit
+}
+
 // The composer's text, cut to what the instance will accept. The instance
 // refuses a longer status with a 422, and the panel cuts it rather than
 // letting the user build a post that cannot be sent.
@@ -220,13 +237,70 @@ function relationshipCmd(helper, id) {
   return [helper, "get", "/api/v1/accounts/relationships[]=" + id]
 }
 
+// An image is uploaded before the status exists: POST /api/v2/media answers
+// with the media id that the status then carries in media_ids[]. Nothing about
+// the file itself travels here — the path arrives through MASTODON_UPLOAD_PATH
+// on the environment, because /proc/<pid>/cmdline is readable by every local
+// user and a filename says what is about to be published.
+function uploadMediaCmd(helper) {
+  return [helper, "upload"]
+}
+
+// The desktop's own file chooser, not Qt's: a QtQuick.Dialogs FileDialog does
+// not open at all inside Quickshell (the window has no platform dialog to
+// parent it to). Omarchy ships this one and it goes through the XDG portal, so
+// the chooser is a normal desktop window. The extensions are the image formats
+// the instance accepts, so the chooser filters to the same set.
+function pickMediaCmd() {
+  return ["omarchy-file-select", "--title", "Attach images", "--multiple",
+    "--extensions", "jpg jpeg png gif webp"]
+}
+
+// The composer holds a list of { path, name, id, previewUrl, failed }. Only the
+// entries the instance has actually accepted belong in a post: a file whose
+// upload came back with an error has no id yet.
+function pendingMediaIds(media) {
+  var ids = []
+  // QML hands arrays on to functions as QVariantList, for which
+  // Array.isArray() is false. Duck-type on length instead.
+  if (!media || typeof media.length !== "number") return ids
+  for (var i = 0; i < media.length; i++) {
+    var entry = media[i]
+    // Entries as well as bare ids are accepted: the panel runs this over its
+    // list of attachments and hands the result to postStatusCmd, which runs it
+    // again. Reading `.id` off a list of id strings yields undefined for every
+    // one of them, which would quietly drop the images from the post.
+    var id = ""
+    if (typeof entry === "string" || typeof entry === "number") {
+      id = String(entry)
+    } else if (entry && entry.id) {
+      id = String(entry.id)
+    }
+    if (id !== "") ids.push(id)
+  }
+  return ids
+}
+
+function baseName(path) {
+  var text = String(path || "")
+  var cut = text.lastIndexOf("/")
+  return cut === -1 ? text : text.substring(cut + 1)
+}
+
 // The status is cut to the limit here as well as in the composer: this is the
 // one place every post passes through, so an instance that lowers its limit
 // between loading the configuration and pressing Post still gets something it
 // will accept rather than a 422.
-function postStatusCmd(helper, text, inReplyToId, maxCharacters) {
-  var cmd = [helper, "post", "/api/v1/statuses", "status=" + limitText(text, maxCharacters)]
+function postStatusCmd(helper, text, inReplyToId, maxCharacters, mediaIds) {
+  var cmd = [helper, "post", "/api/v1/statuses"]
+  var body = limitText(text, maxCharacters)
+  // Mastodon accepts a status without any text as long as it carries media, so
+  // a picture can be posted on its own. Sending "status=" empty instead would
+  // be a status with neither text nor media, which the instance refuses.
+  if (body !== "") cmd.push("status=" + body)
   if (inReplyToId) cmd.push("in_reply_to_id=" + inReplyToId)
+  var ids = pendingMediaIds(mediaIds)
+  for (var i = 0; i < ids.length; i++) cmd.push("media_ids[]=" + ids[i])
   return cmd
 }
 
@@ -529,7 +603,12 @@ if (typeof module !== "undefined") {
     verifyCredentialsCmd: verifyCredentialsCmd,
     instanceConfigCmd: instanceConfigCmd,
     parseMaxCharacters: parseMaxCharacters,
+    parseMaxMediaAttachments: parseMaxMediaAttachments,
     limitText: limitText,
+    uploadMediaCmd: uploadMediaCmd,
+    pickMediaCmd: pickMediaCmd,
+    pendingMediaIds: pendingMediaIds,
+    baseName: baseName,
     homeTimelineCmd: homeTimelineCmd,
     localTimelineCmd: localTimelineCmd,
     mentionsCmd: mentionsCmd,
@@ -561,6 +640,7 @@ if (typeof module !== "undefined") {
     oldestId: oldestId,
     appendUnique: appendUnique,
     PAGE_SIZE: PAGE_SIZE,
+    MAX_MEDIA_PER_STATUS: MAX_MEDIA_PER_STATUS,
     DEFAULT_MAX_CHARACTERS: DEFAULT_MAX_CHARACTERS,
     emptyAuth: emptyAuth,
     decodeAuth: decodeAuth,
