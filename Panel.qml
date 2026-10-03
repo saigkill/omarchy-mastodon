@@ -785,6 +785,7 @@ Panel {
             Text {
               width: parent.width
               visible: root.replyToUser !== ""
+              textFormat: Text.PlainText
               text: "Replying to " + root.replyToUser
               color: Qt.darker(root.contentForeground, 1.5)
               font.family: root.contentFontFamily
@@ -1268,6 +1269,10 @@ Panel {
                   anchors.bottomMargin: Style.space(6)
                   spacing: Style.space(4)
 
+                  // Names, handles and alt text are chosen by other accounts. The
+                  // default AutoText renders anything that looks like markup, so a
+                  // display name with <img src=...> would make the panel fetch that
+                  // URL and leak the viewer's address. Every such label is PlainText.
                   Text {
                     width: parent.width
                     visible: statusDelegate.reblogger !== null
@@ -1276,6 +1281,7 @@ Panel {
                     // relying on visibility — accountDisplayName(null) throws
                     // and that broke the implicitHeight of every card below,
                     // which is why images went missing on unrelated posts.
+                    textFormat: Text.PlainText
                     text: statusDelegate.reblogger !== null
                       ? ("\uf079 " + Model.accountDisplayName(statusDelegate.reblogger) + " boosted")
                       : ""
@@ -1290,6 +1296,7 @@ Panel {
                     spacing: Style.space(6)
 
                     Text {
+                      textFormat: Text.PlainText
                       text: Model.accountDisplayName(statusDelegate.status.account)
                       color: root.contentForeground
                       font.family: root.contentFontFamily
@@ -1300,6 +1307,7 @@ Panel {
 
                     Text {
                       anchors.verticalCenter: parent.verticalCenter
+                      textFormat: Text.PlainText
                       text: Model.accountHandle(statusDelegate.status.account)
                       color: Qt.darker(root.contentForeground, 1.5)
                       font.family: root.contentFontFamily
@@ -1448,6 +1456,7 @@ Panel {
                       }
                       return parts.join("  ·  ")
                     }
+                    textFormat: Text.PlainText
                     text: altText
                     visible: statusDelegate.mediaVisible && altText !== ""
                     color: Qt.darker(root.contentForeground, 1.7)
